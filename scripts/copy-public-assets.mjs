@@ -20,3 +20,4 @@ if(fs.existsSync(distDir)) {
     fs.cpSync(changelogsSrc, changelogsDest, {recursive: true});
   }
 }
+
