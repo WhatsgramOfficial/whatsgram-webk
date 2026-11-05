@@ -301,6 +301,18 @@ export class AppPeersManager extends AppManager {
       return {_: 'inputPeerEmpty'};
     }
 
+    if(peerId === this.rootScope.myId) {
+      const user = this.appUsersManager.getUser(peerId.toUserId());
+      if(user?.access_hash) {
+        return {
+          _: 'inputPeerUser',
+          user_id: user.id,
+          access_hash: user.access_hash
+        };
+      }
+      return {_: 'inputPeerSelf'};
+    }
+
     if(!peerId.isUser()) {
       const chatId = peerId.toChatId();
       if(this.isCommunity(peerId)) {

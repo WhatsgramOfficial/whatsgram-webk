@@ -234,7 +234,9 @@ export default class DialogsStorage extends AppManager {
   }
 
   public indexMyDialog() {
-    const peerId = this.appUsersManager.getSelf().id.toPeerId(false);
+    const self = this.appUsersManager.getSelf();
+    if(!self) return;
+    const peerId = self.id.toPeerId(false);
     const dialog = this.getDialogOnly(peerId);
     if(dialog) {
       const peerText = this.appPeersManager.getPeerSearchText(peerId);

@@ -41,10 +41,12 @@ function isUsingTelesrvDc() {
 
 function constructTelesrvWebSocketUrl() {
   const path = TELESRV_WS_PATH.startsWith('/') ? TELESRV_WS_PATH : '/' + TELESRV_WS_PATH;
-  const protocol = location.protocol === 'https:' ? 'wss' : 'ws';
+  const protocol = typeof location !== 'undefined' && location.protocol === 'https:' ? 'wss' : 'ws';
   const defaultPort = protocol === 'wss' ? '443' : '80';
-  const port = TELESRV_DC_PORT === defaultPort ? '' : `:${TELESRV_DC_PORT}`;
-  return `${protocol}://${TELESRV_DC_HOST}${port}${path}`;
+  const isLocalhost = typeof location !== 'undefined' && (location.hostname === 'localhost' || location.hostname === '127.0.0.1');
+  const host = typeof location !== 'undefined' && location.hostname && !isLocalhost ? location.hostname : TELESRV_DC_HOST;
+  const port = TELESRV_DC_PORT === defaultPort || !TELESRV_DC_PORT ? '' : `:${TELESRV_DC_PORT}`;
+  return `${protocol}://${host}${port}${path}`;
 }
 
 export function getTelegramConnectionSuffix(connectionType: ConnectionType) {

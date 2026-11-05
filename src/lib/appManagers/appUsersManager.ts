@@ -257,7 +257,9 @@ export class AppUsersManager extends AppManager {
   };
 
   public indexMyself() {
-    const userId = this.getSelf().id;
+    const self = this.getSelf();
+    if(!self) return;
+    const userId = self.id;
     this.contactsIndex.indexObject(userId, this.getUserSearchText(userId));
   }
 
@@ -500,6 +502,7 @@ export class AppUsersManager extends AppManager {
 
   public testSelfSearch(query: string) {
     const user = this.getSelf();
+    if(!user) return false;
     const index = this.createSearchIndex();
     index.indexObject(user.id, this.getUserSearchText(user.id));
     return index.search(query).has(user.id);
@@ -860,7 +863,7 @@ export class AppUsersManager extends AppManager {
 
   public getUserString(id: UserId) {
     const user = this.getUser(id);
-    return 'u' + id + (user.access_hash ? '_' + user.access_hash : '');
+    return 'u' + id + (user?.access_hash ? '_' + user.access_hash : '');
   }
 
   public getUserId(userId: Parameters<typeof getPeerId>[0]) {
@@ -869,33 +872,40 @@ export class AppUsersManager extends AppManager {
       return peerId.toUserId();
     }
 
-    return (isObject<InputUser>(userId) && userId._ === 'inputUserSelf' && this.getSelf().id) || NULL_PEER_ID;
+    return (isObject<InputUser>(userId) && userId._ === 'inputUserSelf' && this.getSelf()?.id) || NULL_PEER_ID;
   }
 
   public getUserInput(id: UserId): InputUser {
     const user = this.getUser(id);
-    if(!id || (user.pFlags && user.pFlags.self)) {
+    if(!id || id === this.userId || id.toPeerId() === this.rootScope.myId || (user && user.pFlags && user.pFlags.self)) {
       return {_: 'inputUserSelf'};
     }
 
     return {
       _: 'inputUser',
       user_id: id,
-      access_hash: user.access_hash
+      access_hash: user?.access_hash || '0'
     };
   }
 
   public getUserInputPeer(id: UserId): InputPeer.inputPeerSelf | InputPeer.inputPeerUser {
     const user = this.getUser(id);
-    // ! do not use it, there are places that don't support it. need explicit peer id
-    // if(user.pFlags?.self) {
-    //   return {_: 'inputPeerSelf'};
-    // }
+    if(!id || id === this.userId || id.toPeerId() === this.rootScope.myId || user?.pFlags?.self) {
+      if(user?.access_hash) {
+        return {
+          _: 'inputPeerUser',
+          user_id: id,
+          access_hash: user.access_hash
+        };
+      }
+
+      return {_: 'inputPeerSelf'};
+    }
 
     return {
       _: 'inputPeerUser',
       user_id: id,
-      access_hash: user.access_hash
+      access_hash: user?.access_hash || '0'
     };
   }
 
@@ -904,9 +914,9 @@ export class AppUsersManager extends AppManager {
 
     return {
       _: 'inputMediaContact',
-      first_name: user.first_name,
-      last_name: user.last_name,
-      phone_number: user.phone,
+      first_name: user?.first_name || '',
+      last_name: user?.last_name || '',
+      phone_number: user?.phone || '',
       vcard: '',
       user_id: id
     };
@@ -1184,7 +1194,12 @@ export class AppUsersManager extends AppManager {
   }
 
   public updateMyOnlineStatus(offline: boolean) {
-    this.setUserStatus(this.getSelf().id, offline);
+    const self = this.getSelf();
+    if(self) {
+      this.setUserStatus(self.id, offline);
+    } else if(this.userId) {
+      this.setUserStatus(this.userId, offline);
+    }
     return this.apiManager.invokeApiSingle('account.updateStatus', {offline});
   }
 
@@ -1259,7 +1274,7 @@ export class AppUsersManager extends AppManager {
     }).then(() => {
       this.apiUpdatesManager.processLocalUpdate({
         _: 'updateUserEmojiStatus',
-        user_id: this.getSelf().id,
+        user_id: this.getSelf()?.id || this.userId,
         emoji_status: emojiStatus
       });
     });
