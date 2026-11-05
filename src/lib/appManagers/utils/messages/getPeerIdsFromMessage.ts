@@ -2,10 +2,13 @@ import {Message, MessageAction, MessageMedia, MessageReplyHeader, Peer, WebPage,
 import getPeerId from '@appManagers/utils/peers/getPeerId';
 
 export default function getPeerIdsFromMessage(message: Message.message | Message.messageService) {
+  // * a business bot that wrote the message for its owner is named with it
+  const businessBotId = (message as Message.message).via_business_bot_id as UserId;
   const peerIds: number[] = [
     message.fromId,
     message.viaBotId,
-    (message as Message.message).fwdFromId
+    (message as Message.message).fwdFromId,
+    businessBotId && businessBotId.toPeerId(false)
   ];
 
   const media = (message as Message.message).media;
@@ -57,7 +60,7 @@ export default function getPeerIdsFromMessage(message: Message.message | Message
     const chatIds: ChatId[] = [
       (action as MessageAction.messageActionChatMigrateTo).channel_id,
       (action as MessageAction.messageActionChannelMigrateFrom).chat_id,
-      (action as MessageAction.messageActionChangeCommunity).community_id
+      (action as MessageAction.messageActionChangeCommunity | MessageAction.messageActionChatJoinedViaCommunity).community_id
     ];
     peerIds.push(...chatIds.filter(Boolean).map((chatId) => chatId.toPeerId(true)));
 

@@ -1,4 +1,4 @@
-import {createMemo, onMount} from 'solid-js';
+import {createMemo, createSignal, For, onMount} from 'solid-js';
 import anchorCallback from '@helpers/dom/anchorCallback';
 import {randomLong} from '@helpers/random';
 import {LangPackLanguage} from '@layer';
@@ -7,14 +7,14 @@ import rootScope from '@lib/rootScope';
 import usePremium from '@stores/premium';
 import {pickLanguage} from '@components/chat/translation';
 import CheckboxFieldTsx from '@components/checkboxFieldTsx';
-import PopupPremium from '@components/popups/premium';
-import RadioField from '@components/radioField';
-import Row, {RadioFormFromRows} from '@components/row';
+import RadioFieldTsx from '@components/radioFieldTsx';
 import RowTsx from '@components/rowTsx';
 import Section from '@components/section';
 import {useAppSettings} from '@stores/appSettings';
 import {useSuperTab} from '@components/solidJsTabs/superTabProvider';
 import {usePromiseCollector} from '@components/solidJsTabs/promiseCollector';
+import {hotReloadGuard} from '@lib/solidjs/hotReloadGuardProvider';
+import getDoNotTranslateLanguages from '@helpers/getDoNotTranslateLanguages';
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Section 1 — translation toggles + "Do not translate" picker
@@ -24,21 +24,14 @@ const TranslateSection = () => {
   const [appSettings, setAppSettings] = useAppSettings();
   const isPremium = usePremium();
 
-  const doNotTranslate = createMemo(() => {
-    const arr = appSettings.translations.doNotTranslate;
-    if(!arr.length) {
-      return [I18n.langCodeNormalized()];
-    }
-
-    return arr;
-  });
+  const doNotTranslate = createMemo(() => getDoNotTranslateLanguages(appSettings.translations.doNotTranslate));
 
   return (
     <Section
       name="TranslateMessages"
       caption={isPremium() ? 'Translation.DoNotShow' : 'Language.TranslateMessages.Channel.Premium'}
       captionArgs={[anchorCallback(() => {
-        PopupPremium.show({feature: 'translations'});
+        hotReloadGuard.showPremiumPopup({feature: 'translations'});
       })]}
     >
       <RowTsx>
@@ -55,12 +48,10 @@ const TranslateSection = () => {
       </RowTsx>
       <RowTsx
         fakeDisabled={!isPremium()}
-        clickable={(e) => {
-          if(!isPremium()) {
-            e.preventDefault();
-            PopupPremium.show({feature: 'translations'});
-          }
-        }}
+        clickable={!isPremium() ? (e) => {
+          e.preventDefault();
+          hotReloadGuard.showPremiumPopup({feature: 'translations'});
+        } : undefined}
       >
         <RowTsx.CheckboxFieldToggle>
           <CheckboxFieldTsx
@@ -73,7 +64,8 @@ const TranslateSection = () => {
         </RowTsx.CheckboxFieldToggle>
         <RowTsx.Title>{i18n('ShowTranslateChatButton')}</RowTsx.Title>
       </RowTsx>
-      {appSettings.translations.enabled && (<RowTsx
+      {/* the list the Translate button reads too (tdesktop shows it while either is on) */}
+      {(appSettings.translations.showInMenu || appSettings.translations.enabled) && (<RowTsx
         clickable={async() => {
           const languages = await pickLanguage(true, doNotTranslate());
           setAppSettings('translations', 'doNotTranslate', languages);
@@ -95,60 +87,61 @@ const TranslateSection = () => {
 // Section 2 — language radio list. The fetch is collected into the tab's
 // promise collector so opening waits for the list (avoids showing an empty
 // section that suddenly fills with 50+ rows). On repeat opens
-// `invokeApiCacheable` returns synchronously from cache, so no real wait.
+// `appLangPackManager.getLanguages` answers from its cache, so no real wait.
 // ─────────────────────────────────────────────────────────────────────────────
 
 const LanguageListSection = () => {
   const promiseCollector = usePromiseCollector();
-  let containerEl!: HTMLDivElement;
+  const [languages, setLanguages] = createSignal<LangPackLanguage[]>([]);
+  const [selectedLanguage, setSelectedLanguage] = createSignal<string>();
+  const radioName = randomLong();
+  let webLangCodes: string[] = [];
 
   promiseCollector.collect((async() => {
-    const langs1 = await rootScope.managers.apiManager.invokeApiCacheable('langpack.getLanguages', {
-      lang_pack: 'web'
-    });
+    const langs1 = await rootScope.managers.appLangPackManager.getLanguages('web');
     // macos langpack disabled in legacy tab — kept the structure for parity
     const langs2: LangPackLanguage[] = [];
 
-    const radioRows = new Map<string, Row>();
     const rendered = new Set<string>();
-    const webLangCodes = langs1.map((language) => language.lang_code);
-    const random = randomLong();
-
-    langs1.concat(langs2).forEach((language) => {
-      if(rendered.has(language.lang_code)) return;
+    webLangCodes = langs1.map((language) => language.lang_code);
+    setLanguages(langs1.concat(langs2).filter((language) => {
+      if(rendered.has(language.lang_code)) return false;
       rendered.add(language.lang_code);
-
-      const row = new Row({
-        radioField: new RadioField({
-          text: language.name,
-          name: random,
-          value: language.lang_code
-        }),
-        subtitle: language.native_name
-      });
-
-      radioRows.set(language.lang_code, row);
-    });
-
-    const form = RadioFormFromRows([...radioRows.values()], (value) => {
-      I18n.getLangPackAndApply(value, webLangCodes.includes(value));
-    });
-
-    containerEl.replaceChildren(form);
+      return true;
+    }));
 
     const langPack = await I18n.getCacheLangPackAndApply();
-    const row = radioRows.get(langPack.lang_code);
-    if(!row) {
-      console.error('no row', row, langPack);
+    if(!rendered.has(langPack.lang_code)) {
+      console.error('no language row', langPack);
       return;
     }
 
-    row.radioField.setValueSilently(true);
+    setSelectedLanguage(langPack.lang_code);
   })());
 
   return (
     <Section>
-      <div ref={containerEl} />
+      <form>
+        <For each={languages()}>{(language) => (
+          <RowTsx>
+            <RowTsx.RadioField>
+              <RadioFieldTsx
+                class="disable-hover"
+                checked={selectedLanguage() === language.lang_code}
+                name={radioName}
+                value={language.lang_code}
+                onChange={(checked) => {
+                  if(!checked) return;
+                  setSelectedLanguage(language.lang_code);
+                  I18n.getLangPackAndApply(language.lang_code, webLangCodes.includes(language.lang_code));
+                }}
+              />
+            </RowTsx.RadioField>
+            <RowTsx.Title>{language.name}</RowTsx.Title>
+            <RowTsx.Subtitle>{language.native_name}</RowTsx.Subtitle>
+          </RowTsx>
+        )}</For>
+      </form>
     </Section>
   );
 };

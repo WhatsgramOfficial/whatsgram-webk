@@ -2,7 +2,8 @@ import AppSelectPeers from '@components/appSelectPeers';
 import {setButtonLoader} from '@components/putPreloader';
 import ButtonCorner from '@components/buttonCorner';
 import Button from '@components/button';
-import SettingSection from '@components/settingSection';
+import Section from '@components/section';
+import {unwrapSolidElement} from '@helpers/solid/wrapSolidComponent';
 import {i18n} from '@lib/langPack';
 import {useSuperTab} from '@components/solidJsTabs/superTabProvider';
 import type {AppAddMembersTab} from '@components/solidJsTabs/tabs';
@@ -21,6 +22,7 @@ const AddMembersTab = () => {
     selectedExtras,
     extraCategories,
     extraCategoriesSectionLangKey,
+    peersSectionLangKey,
     peerType,
     channelParticipantsPeerId,
     peerLoader,
@@ -32,7 +34,7 @@ const AddMembersTab = () => {
 
   tab.container.classList.add('add-members-container');
 
-  const nextBtn = ButtonCorner({icon: 'arrow_next'});
+  const nextBtn = ButtonCorner({icon: 'arrow_next', ariaLabel: 'Next'});
   tab.content.append(nextBtn);
   tab.scrollable.container.remove();
 
@@ -72,6 +74,7 @@ const AddMembersTab = () => {
     peerId: channelParticipantsPeerId,
     getMoreCustom: peerLoader,
     placeholder,
+    sectionNameLangPackKey: peersSectionLangKey,
     exceptSelf: exceptSelf ??
       (isPrivacy || !!channelParticipantsPeerId || !!peerLoader),
     filterPeerTypeBy: filterPeerTypeBy ??
@@ -99,20 +102,22 @@ const AddMembersTab = () => {
       extraCategories.map((c) => [c.key, c])
     );
 
-    const categoriesSection = new SettingSection({
-      noDelimiter: true,
-      name: extraCategoriesSectionLangKey
-    });
-    categoriesSection.container.classList.add('folder-categories');
-
-    const f = document.createDocumentFragment();
-    for(const cat of extraCategories) {
+    const categoryButtons = extraCategories.map((cat) => {
       const button = Button('btn-primary btn-transparent folder-category-button', {icon: cat.icon, text: cat.text});
       button.dataset.peerId = cat.key;
       button.append(selector.checkbox());
-      f.append(button);
-    }
-    categoriesSection.content.append(f);
+      return button;
+    });
+
+    const categoriesSection = unwrapSolidElement(
+      <Section
+        class="folder-categories"
+        noDelimiter
+        name={extraCategoriesSectionLangKey}
+      >
+        {categoryButtons}
+      </Section>
+    ) as HTMLElement;
 
     const _add = selector.add.bind(selector);
     selector.add = ({key, title, scroll, fireOnChange, fallbackIcon}) => {
@@ -127,7 +132,7 @@ const AddMembersTab = () => {
     };
 
     selector.scrollable.append(
-      categoriesSection.container,
+      categoriesSection,
       selector.scrollable.container.lastElementChild
     );
   }

@@ -59,6 +59,30 @@ type MinimalBlockingIterateResponsesCallbackArgs = {
 
 export type CacheStorageDbName = keyof typeof cacheStorageDbConfig;
 
+// * An entry's name becomes the path of a request, and a URL reads meaning into a path: a dot segment
+// * (`..`, `%2e%2e`) climbs out of it, `\` splits it like `/`, a leading `//` makes it another site,
+// * `#` cuts it off, tabs and newlines are dropped, a lone surrogate turns into U+FFFD. A name holding
+// * text from outside (a web file's URL, set by a bot) would then read or overwrite another file's
+// * entry - of any account, the cache is the browser's. So every character a URL reads something into
+// * is escaped, `%` with them, and each name gets a path of its own: a segment never starts with a dot
+// * (`%u002E` there, as a URL reads `%2E` as a dot too) and the name never with `/`.
+// * The names the app makes (ids, digits, underscores, `backgrounds/<slug>?blur`) stay as they were,
+// * and so do their entries.
+const ENTRY_NAME_ESCAPED = /^\/|(^|\/)\.|[^A-Za-z0-9\-_.~!$&'()*+,;=:@/?\u0080-\uD7FF\uE000-\u{10FFFF}]/gu;
+
+function getEntryRequestPath(entryName: string) {
+  return '/' + entryName.replace(ENTRY_NAME_ESCAPED, (char, segmentStart?: string) => {
+    if(segmentStart !== undefined) {
+      return segmentStart + '%u002E';
+    }
+
+    const code = char.charCodeAt(0);
+    return code < 0x80 ?
+      '%' + code.toString(16).toUpperCase().padStart(2, '0') :
+      '%u' + code.toString(16).toUpperCase(); // * a lone surrogate
+  });
+}
+
 export default class CacheStorageController implements FileStorage {
   private static STORAGES: CacheStorageController[] = [];
   private openDbPromise: Promise<Cache>;
@@ -69,6 +93,20 @@ export default class CacheStorageController implements FileStorage {
   private static disabledPromise: CancellablePromise<void>;
 
   private static disabledPromisesByKey: Map<string, CancellablePromise<void>> = new Map();
+
+  // * A cache.put hands the body to the browser process; while it is in flight the bytes are held on
+  // * both sides. An operation that never settles (the timeout below rejects the CALLER, not the
+  // * underlying put) pins them for good - so count them. See memoryStats.
+  private static inFlightOperations = 0;
+  private static inFlightSaveBytes = 0;
+
+  public static getStats() {
+    return {
+      storages: this.STORAGES.length,
+      inFlightOperations: this.inFlightOperations,
+      inFlightSaveBytes: this.inFlightSaveBytes
+    };
+  }
 
   // private log: ReturnType<typeof logger> = logger('CS');
 
@@ -149,7 +187,7 @@ export default class CacheStorageController implements FileStorage {
   }
 
   public delete(entryName: string) {
-    return this.timeoutOperation((cache) => cache.delete('/' + entryName));
+    return this.timeoutOperation((cache) => cache.delete(getEntryRequestPath(entryName)));
   }
 
   /**
@@ -194,14 +232,14 @@ export default class CacheStorageController implements FileStorage {
   }
 
   public async has(entryName: string) {
-    const response = await this.timeoutOperation((cache) => cache.match('/' + entryName));
+    const response = await this.timeoutOperation((cache) => cache.match(getEntryRequestPath(entryName)));
     return !!response;
   }
 
   public async get(entryName: string) {
     await this.waitToEnable();
 
-    const response = await this.timeoutOperation((cache) => cache.match('/' + entryName));
+    const response = await this.timeoutOperation((cache) => cache.match(getEntryRequestPath(entryName)));
     if(!response) return undefined;
 
     if(this.config?.encryptable && await DeferredIsUsingPasscode.isUsingPasscode()) {
@@ -244,7 +282,7 @@ export default class CacheStorageController implements FileStorage {
       );
     }
 
-    return this.timeoutOperation((cache) => cache.put('/' + entryName, result));
+    return this.timeoutOperation((cache) => cache.put(getEntryRequestPath(entryName), result), undefined, size);
   }
 
   public getFile(fileName: string, method: 'blob' | 'json' | 'text' = 'blob'): Promise<any> {
@@ -279,11 +317,20 @@ export default class CacheStorageController implements FileStorage {
     return this.save({entryName: fileName, response, size: blob.size}).then(() => blob as Blob);
   }
 
-  public timeoutOperation<T>(callback: (cache: Cache) => Promise<T>, operationTimeout = defaultOperationTimeout) {
+  // * `bytes` is only for accounting (see memoryStats): the counters follow the UNDERLYING
+  // * operation, not the caller's promise - the timeout below rejects the caller while cache.put
+  // * keeps running and keeps holding the body.
+  public timeoutOperation<T>(
+    callback: (cache: Cache) => Promise<T>,
+    operationTimeout = defaultOperationTimeout,
+    bytes = 0
+  ) {
     if(!this.useStorage) {
       return Promise.reject(makeError('STORAGE_OFFLINE'));
     }
 
+    ++CacheStorageController.inFlightOperations;
+    CacheStorageController.inFlightSaveBytes += bytes;
     return new Promise<T>(async(resolve, reject) => {
       let rejected = false;
       const timeout = setTimeout(() => {
@@ -306,9 +353,11 @@ export default class CacheStorageController implements FileStorage {
         resolve(res);
       } catch(err) {
         reject(err);
+      } finally {
+        --CacheStorageController.inFlightOperations;
+        CacheStorageController.inFlightSaveBytes -= bytes;
+        clearTimeout(timeout);
       }
-
-      clearTimeout(timeout);
     });
   }
 

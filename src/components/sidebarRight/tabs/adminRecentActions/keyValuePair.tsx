@@ -1,4 +1,6 @@
 import {JSX, Show} from 'solid-js';
+import buttonKeyDown from '@helpers/solid/buttonKeyDown';
+import Modes from '@config/modes';
 import {I18nTsx} from '@helpers/solid/i18n';
 import {ExportedChatInvite} from '@layer';
 import {i18n} from '@lib/langPack';
@@ -22,6 +24,9 @@ export const KeyValuePair = (props: {
         'interactable': props.interactable || !!props.onClick,
         [styles.hoverable]: !!props.onClick
       }}
+      role={props.onClick ? 'button' : undefined}
+      tabindex={props.onClick && Modes.a11y ? 0 : undefined}
+      onKeyDown={props.onClick ? buttonKeyDown : undefined}
       onClick={props.onClick}
     >
       <div class={styles.Border} />
@@ -44,14 +49,16 @@ export const BooleanKeyValue = (props: {
   />
 );
 
+// * a member let in from a public group's own join requests came through no link: that is what stands for it
 export const InviteKeyValue = (props: {invite: ExportedChatInvite}) => {
   return (
-    <Show when={props.invite._ === 'chatInviteExported'}>
-      <KeyValuePair
-        label={<I18nTsx key='InviteLink' />}
-        value={props.invite._ === 'chatInviteExported' ? props.invite.link : ''}
-      />
-    </Show>
+    <KeyValuePair
+      label={<I18nTsx key='InviteLink' />}
+      value={props.invite._ === 'chatInviteExported' ?
+        props.invite.link :
+        <I18nTsx key='AdminRecentActions.PublicJoinRequest' />
+      }
+    />
   );
 };
 

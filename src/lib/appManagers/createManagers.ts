@@ -56,11 +56,13 @@ import AppGifsManager from '@appManagers/appGifsManager';
 import {ActiveAccountNumber} from '@lib/accounts/types';
 import {AppManager} from '@appManagers/manager';
 import AppGiftsManager from '@appManagers/appGiftsManager';
+import AppSavedMusicManager from '@appManagers/appSavedMusicManager';
 import AppGamesManager from '@appManagers/appGamesManager';
 import MonoforumDialogsStorage from '@lib/storages/monoforumDialogs';
 import AppPromoManager from '@appManagers/appPromoManager';
 import AppAccountManager from '@appManagers/appAccountManager';
 import {AiTonesManager} from '@lib/appManagers/aiTonesManager';
+import AppWalletManager from '@appManagers/appWalletManager';
 
 export default function createManagers(
   appStoragesManager: AppStoragesManager,
@@ -123,11 +125,13 @@ export default function createManagers(
     appTranslationsManager: new AppTranslationsManager,
     appGifsManager: new AppGifsManager,
     appGiftsManager: new AppGiftsManager,
+    appSavedMusicManager: new AppSavedMusicManager,
     appGamesManager: new AppGamesManager,
     monoforumDialogsStorage: new MonoforumDialogsStorage,
     appPromoManager: new AppPromoManager,
     appAccountManager: new AppAccountManager,
-    aiTonesManager: new AiTonesManager
+    aiTonesManager: new AiTonesManager,
+    appWalletManager: new AppWalletManager
   };
 
   managers.authorizer = new Authorizer({

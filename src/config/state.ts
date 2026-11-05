@@ -14,6 +14,7 @@ import {ColoredBrushType} from '@components/mediaEditor/context';
 import {FontKey} from '@components/mediaEditor/types';
 import type {BotConnectionReview} from '@appManagers/appBusinessManager';
 import type {UnconfirmedAuthorization} from '@appManagers/appAccountManager';
+import type {ContactsSortMode} from '@appManagers/utils/users/sortContacts';
 
 // Factory tinted ("Dark") collapses onto the first base-color preset (blue) so the accent picker
 // can omit a separate "default" swatch — resetting to factory now reaches the same state the user
@@ -58,6 +59,9 @@ export type AutoDownloadPeerTypeSettings = {
 export type StateSettings = {
   messagesTextSize: number,
   distanceUnit: 'kilometers' | 'miles',
+  // Only written once the reader flips a story's weather widget; until then the unit follows the
+  // locale, so there is nothing to store and no settings row to show (same as tdesktop).
+  temperatureUnit?: 'celsius' | 'fahrenheit',
   sendShortcut: 'enter' | 'ctrlEnter',
   animationsEnabled?: boolean, // ! DEPRECATED
   autoDownload: {
@@ -77,7 +81,14 @@ export type StateSettings = {
   stickers: {
     suggest: 'all' | 'installed' | 'none',
     dynamicPackOrder: boolean,
-    loop: boolean
+    loop: boolean,
+    /**
+     * Groups whose own sticker set / emoji pack the user collapsed in the panel, as
+     * `chatId` -> the set id that was collapsed. Keyed by set so that a group swapping
+     * packs brings the section back.
+     */
+    hiddenGroupSets: {[chatId: string]: string},
+    hiddenGroupEmojiSets: {[chatId: string]: string}
   },
   emoji: {
     suggest: boolean,
@@ -86,6 +97,7 @@ export type StateSettings = {
   background?: Background, // ! DEPRECATED
   themes: AppTheme[],
   theme: AppTheme['name'],
+  increaseContrast: boolean,
   // Last explicitly-picked theme variant on each side. The burger-menu Dark-Mode toggle uses
   // these so toggling away and back returns to the same variant (e.g. tinted ↔ classic ↔ tinted)
   // instead of always flipping to the legacy night/classic pair. Updated in themeController on
@@ -93,6 +105,12 @@ export type StateSettings = {
   lastThemeNames: {
     dark: Extract<AppTheme['name'], 'night' | 'tinted'>,
     light: Extract<AppTheme['name'], 'day' | 'light'>
+  },
+  // Empty-column tip cards (@components/chatTips): which tip is showing, and whether the deck is
+  // collapsed to the "select a chat" pill. macOS keeps the same collapse in FastSettings.emptyTips.
+  chatTips: {
+    index: number,
+    hidden: boolean
   },
   notifications: {
     sound: boolean,
@@ -110,11 +128,17 @@ export type StateSettings = {
   savedAsForum: boolean,
   notifyAllAccounts: boolean,
   tabsInSidebar: boolean,
+  showPeerIds: boolean,
+  /** Ids of the settings-search results picked last, most recent first. */
+  settingsSearchRecent: string[],
   seenTooltips: {
     storySound: boolean,
     noForwards: boolean,
     sidebarResize: boolean,
-    guestBotPrivacy: number // how many times the guest-bot hint has been shown (capped at 2, like iOS)
+    guestBotPrivacy: number, // how many times the guest-bot hint has been shown (capped at 2, like iOS)
+    storyReactions: boolean, // * "long tap for more reactions" on a story's heart, once ever (iOS, Android)
+    storyStealthReply: boolean, // * the warning that a reply or reaction shows you in Stealth Mode, once ever (iOS)
+    walletGram: number // how many times the wallet's "Gram" hint over the card's gem has been shown (capped at 3, like iOS)
   },
   playbackParams: ReturnType<AppMediaPlaybackController['getPlaybackParams']>,
   translations: {
@@ -149,6 +173,11 @@ export type StateSettings = {
     textStyle?: string;
     textFont?: FontKey;
   },
+  // Name this browser reports to Telegram as `device_model` in initConnection —
+  // what other devices see in Active Sessions. Empty = the raw user agent.
+  // Renaming only reaches the server on the next initConnection, which
+  // networkerFactory forces by dropping `connectionInited`.
+  customDeviceModel: string,
   // Persisted device choices for the audio/video stack used by the
   // SettingsCallsPanel ("Speakers and Camera" tab) and the per-call settings
   // popup. Empty string = follow the OS default (no setSinkId / no deviceId
@@ -159,10 +188,10 @@ export type StateSettings = {
     microphoneId: string,
     cameraId: string,
     micVolume: number,
-    // Whether to apply the browser's `noiseSuppression` constraint when
-    // requesting a microphone stream. Skipped if the browser doesn't
-    // advertise support (`IS_NOISE_SUPPRESSION_SUPPORTED`). Default true
-    // matches tdesktop / the legacy behavior before this flag existed.
+    // The call settings' "Noise suppression" switch: RNNoise on the
+    // microphone where the browser can run it (calls/noiseSuppression),
+    // otherwise the browser's own `noiseSuppression` constraint. On by
+    // default, as the browser's suppression was before the switch existed.
     noiseSuppression: boolean
   },
   // What the composer's recording button captures when the input is empty.
@@ -171,6 +200,9 @@ export type StateSettings = {
   // clicking the button itself (when input is empty), matches the per-client
   // toggle in tdesktop / iOS / Android.
   recordingMediaType: 'voice' | 'video',
+  // The order the contacts tab lists them in, kept between visits the way Android and iOS keep it
+  // (tdesktop opens its contacts by last seen every time)
+  contactsSortMode: ContactsSortMode,
   // My QR-code popup: remembers the user's last picked chat-theme + brightness
   // so reopens land back where they left off. `nightMode` falls back to the
   // global theme's brightness when unset; `selectedThemeId` empty = the
@@ -179,6 +211,11 @@ export type StateSettings = {
     nightMode?: boolean,
     selectedThemeId: string
   },
+  stories: {
+    // other people's story videos play in their original quality, not the lower one the server keeps
+    // beside it — Premium only, as on iOS and Android (Android's default: on)
+    highQuality: boolean
+  }
 };
 
 // (1 - use swatch, 2 - use picker color), (color from swatch), (color from picker)
@@ -204,6 +241,8 @@ export type State = {
   }>,
   // filters?: FiltersStorage['filters'], // ! DEPRECATED
   filtersArr?: FiltersStorage['filtersArr'],
+  // * `messages.dialogFilters.tags_enabled` - undefined until the server has been asked
+  filtersTagsEnabled?: boolean,
   maxSeenMsgId: number,
   stateCreatedTime: number,
   recentEmoji: string[],
@@ -212,14 +251,28 @@ export type State = {
   topPeersCache: {
     [type in TopPeerType]?: {
       peers: MyTopPeer[],
-      cachedTime: number
+      cachedTime: number,
+      // * `contacts.topPeersDisabled`: the user turned the lists off. Missing from a list kept before
+      // * the switch was there: an empty one of those says nothing of it
+      disabled?: boolean
     }
   },
   recentSearch: PeerId[],
+  /** Peers whose chat was left behind — closed outright, or switched away from. Newest first. */
+  recentlyClosedChats: PeerId[],
+  /** The wallet each profile showed when last opened: the memory of whose address is whose */
+  walletAddresses: {[userId: UserId]: string},
   version: typeof STATE_VERSION,
   build: typeof BUILD,
   authState: AuthState,
-  hiddenPinnedMessages: {[peerId: PeerId]: number},
+  /** Who it is kept for: Web A signs other users in and out of the same slot (see loadState) */
+  userId?: UserId,
+  /** Key: `getPinnedMessagesKey(peerId, threadId)` — thread-scoped in a forum topic. */
+  hiddenPinnedMessages: {[peerIdOrThreadKey: string]: number},
+  /** Key: a history storage's (a topic's is its own), value: the message of the bot keyboard the user closed there. */
+  closedReplyKeyboards: {[historyStorageKey: string]: number},
+  /** Key: a history storage's, value: the message of the force reply whose answer in the field the user dropped there. */
+  droppedForceReplies: {[historyStorageKey: string]: number},
   hideChatJoinRequests: {[peerId: PeerId]: number},
   botConnectionReviews: BotConnectionReview[],
   // stateId?: number, // ! DEPRECATED
@@ -238,6 +291,8 @@ export type State = {
   },
   accountContentSettings: CacheSomething<AccountContentSettings>,
   unconfirmedAuthorizations: UnconfirmedAuthorization[],
+  /** When the session this client runs on was created — see FRESH_AUTHORIZATION_PERIOD */
+  currentAuthorizationDate: number,
 
 
   // playbackParams?: StateSettings['playbackParams'], // ! MIGRATED TO SETTINGS
@@ -456,7 +511,9 @@ export const SETTINGS_INIT: StateSettings = {
   stickers: {
     suggest: 'all',
     dynamicPackOrder: true,
-    loop: true
+    loop: true,
+    hiddenGroupSets: {},
+    hiddenGroupEmojiSets: {}
   },
   emoji: {
     suggest: true,
@@ -469,9 +526,14 @@ export const SETTINGS_INIT: StateSettings = {
     makeDefaultAppTheme('light')
   ],
   theme: 'system',
+  increaseContrast: false,
   lastThemeNames: {
     dark: 'night',
     light: 'day'
+  },
+  chatTips: {
+    index: 0,
+    hidden: false
   },
   notifications: {
     sound: false,
@@ -485,6 +547,7 @@ export const SETTINGS_INIT: StateSettings = {
   liteMode: {
     all: false,
     animations: false,
+    motion: false,
     blur: false,
     chat: false,
     chat_background: false,
@@ -506,6 +569,8 @@ export const SETTINGS_INIT: StateSettings = {
   savedAsForum: false,
   notifyAllAccounts: true,
   tabsInSidebar: false,
+  showPeerIds: false,
+  settingsSearchRecent: [],
   playbackParams: {
     volume: 1,
     boost: 0,
@@ -524,7 +589,10 @@ export const SETTINGS_INIT: StateSettings = {
     storySound: false,
     noForwards: false,
     sidebarResize: false,
-    guestBotPrivacy: 0
+    guestBotPrivacy: 0,
+    storyReactions: false,
+    storyStealthReply: false,
+    walletGram: 0
   },
   translations: {
     peers: {},
@@ -549,6 +617,7 @@ export const SETTINGS_INIT: StateSettings = {
   mediaEditor: {
     colorByBrush: {}
   },
+  customDeviceModel: '',
   callDevices: {
     speakerId: '',
     microphoneId: '',
@@ -557,8 +626,12 @@ export const SETTINGS_INIT: StateSettings = {
     noiseSuppression: true
   },
   recordingMediaType: 'voice',
+  contactsSortMode: 'online',
   qrCode: {
     selectedThemeId: ''
+  },
+  stories: {
+    highQuality: true
   }
 };
 
@@ -579,12 +652,17 @@ export const STATE_INIT: State = {
   emojiVariants: {},
   topPeersCache: {},
   recentSearch: [],
+  recentlyClosedChats: [],
+  walletAddresses: {},
   version: STATE_VERSION,
   build: BUILD,
   authState: {
     _: IS_MOBILE ? 'authStateSignIn' : 'authStateSignQr'
   },
+  userId: undefined,
   hiddenPinnedMessages: {},
+  closedReplyKeyboards: {},
+  droppedForceReplies: {},
   hideChatJoinRequests: {},
   botConnectionReviews: [],
   // stateId: nextRandomUint(32),
@@ -596,7 +674,8 @@ export const STATE_INIT: State = {
   birthdayContactsDismissedDayKey: undefined,
   dontShowPaidMessageWarningFor: [],
   accountContentSettings: {} as any,
-  unconfirmedAuthorizations: []
+  unconfirmedAuthorizations: [],
+  currentAuthorizationDate: 0
 };
 
 export const COMMON_STATE_INIT: CommonState = {

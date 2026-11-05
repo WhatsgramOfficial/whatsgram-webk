@@ -78,6 +78,14 @@ vi.mock('@components/popups/indexTsx', () => {
 });
 
 import showCommunityPrivateChat from '@components/popups/communityPrivateChat';
+import * as mocked1 from '@lib/appImManager';
+import {registerHotReloadGuard} from '@lib/solidjs/hotReloadGuardProvider';
+
+// the code under test reads the top level from the registry, not from the modules mocked above
+registerHotReloadGuard({
+  appImManager: (mocked1 as any).default
+});
+
 
 const channelId = 10 as ChatId;
 const peerId = channelId.toPeerId(true);
@@ -136,7 +144,7 @@ describe('Community private chat sheet', () => {
     expect(container.textContent).not.toContain(
       'Community.SuggestedChannel'
     );
-    const infoIcon = container.querySelector('[data-icon="eye2"]');
+    const infoIcon = container.querySelector('[data-icon="eye2_filled"]');
     expect(infoIcon).not.toBeNull();
     expect(infoIcon.classList).toContain('inline-icon');
     expect(infoIcon.classList).toContain('inline-icon-left');

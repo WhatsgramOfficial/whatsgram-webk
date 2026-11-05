@@ -1,19 +1,21 @@
 import bigInt from 'big-integer';
-import PopupElement from '.';
+import PopupElement, {createPopup} from '@components/popups/indexTsx';
 import {Birthday, Chat, InputInvoice, Message, StarGift, StarGiftAttribute, StarGiftAttributeId, TextWithEntities, User} from '@layer';
 import {MyPremiumGiftOption, MyStarGift} from '@appManagers/appGiftsManager';
 import {STARS_CURRENCY} from '@appManagers/constants';
 import {AvatarNewTsx} from '@components/avatarNew';
-import {i18n, LangPackKey} from '@lib/langPack';
+import MediaHeader from '@components/mediaHeader';
+import I18n, {i18n, LangPackKey} from '@lib/langPack';
 import {Accessor, createEffect, createMemo, createSignal, For, on, onCleanup, onMount, Setter, Show} from 'solid-js';
 import paymentsWrapCurrencyAmount from '@helpers/paymentsWrapCurrencyAmount';
-import PopupStars, {StarsBalance, StarsStar} from '@components/popups/stars';
+import showStarsPopup from '@components/popups/stars';
+import {StarsBalance, StarsStar} from '@components/stars/starsAmount';
 import LottieAnimation from '@components/lottieAnimation';
 import lottieLoader from '@lib/lottie/lottieLoader';
 import classNames from '@helpers/string/classNames';
 import {StarGiftsGrid} from '@components/stargifts/stargiftsGrid';
 import {fastRaf} from '@helpers/schedulers';
-import PopupStarGiftInfo from '@components/popups/starGiftInfo';
+import showStarGiftInfoPopup from '@components/popups/starGiftInfo';
 import {FakeBubbles} from '@components/chat/bubbles/fakeBubbles';
 import {ServiceBubble} from '@components/chat/bubbles/service';
 import {StarGiftBubble} from '@components/chat/bubbles/starGift';
@@ -22,6 +24,7 @@ import rootScope from '@lib/rootScope';
 import Row from '@components/rowTsx';
 import CheckboxFieldTsx from '@components/checkboxFieldTsx';
 import Button from '@components/buttonTsx';
+import attachPlainMessageEditor from '@components/chat/inputEditor/plainField';
 import getRichValueWithCaret from '@helpers/dom/getRichValueWithCaret';
 import {PremiumGiftBubble} from '@components/chat/bubbles/premiumGift';
 import {formatMonthsDuration} from '@helpers/date';
@@ -29,7 +32,7 @@ import wrapRichText from '@lib/richTextProcessor/wrapRichText';
 import {render} from 'solid-js/web';
 import {ButtonIconTsx} from '@components/buttonIconTsx';
 import numberThousandSplitter, {numberThousandSplitterForStars} from '@helpers/number/numberThousandSplitter';
-import PopupPayment from '@components/popups/payment';
+import {createPaymentPopup} from '@components/popups/payment';
 import {TransitionSliderTsx} from '@components/transitionTsx';
 import maybe2x from '@helpers/maybe2x';
 import {I18nTsx} from '@helpers/solid/i18n';
@@ -55,8 +58,6 @@ import {inputStarGiftEquals} from '@appManagers/utils/gifts/inputStarGiftEquals'
 import getStarGiftSendPolicy, {DisallowedGifts} from '@appManagers/utils/gifts/getStarGiftSendPolicy';
 import {updateStarGift} from '@appManagers/utils/gifts/updateStarGift';
 import {ChipTab, ChipTabs} from '@components/chipTabs';
-import safeAssign from '@helpers/object/safeAssign';
-import PopupPremium from '@components/popups/premium';
 import tsNow from '@helpers/tsNow';
 import confirmationPopup from '@components/confirmationPopup';
 import {toastNew} from '@components/toast';
@@ -64,9 +65,14 @@ import createStarGiftUpgradePopup from '@components/popups/starGiftUpgrade';
 import {createProfileGiftsStore, StarGiftsProfileActions, StarGiftsProfileStore} from '@components/stargifts/profileStore';
 import transferStarGift from '@components/popups/transferStarGift';
 import {unwrap} from 'solid-js/store';
+import buttonKeyDown from '@helpers/solid/buttonKeyDown';
+import Modes from '@config/modes';
 
 import styles from '@components/popups/sendGift.module.scss';
 import Animated from '@helpers/solid/animations';
+import smoothScrollBehavior from '@helpers/dom/smoothScrollBehavior';
+import {hotReloadGuard} from '@lib/solidjs/hotReloadGuardProvider';
+import {bindManagersToSession} from '@lib/accounts/bindManagersToAccount';
 
 type GiftOption = MyStarGift | MyPremiumGiftOption;
 
@@ -118,20 +124,20 @@ function GiftOptionsPage(props: {
 
   const giftPremiumSection = !!props.premiumOptions.length && props.peer._ === 'user' && !isToSelf && (
     <>
-      <div class={styles.mainTitle}>
-        {i18n('GiftPremium')}
-      </div>
-      <div class={styles.mainSubtitle}>
-        <I18nTsx
-          key="GiftTelegramPremiumDescription"
-          args={<PeerTitleTsx peerId={props.peerId} onlyFirstName={props.peer._ === 'user'} />}
-        />
-      </div>
+      <MediaHeader class={styles.intro}>
+        <MediaHeader.Title>{i18n('GiftPremium')}</MediaHeader.Title>
+        <MediaHeader.Subtitle>
+          <I18nTsx
+            key="GiftTelegramPremiumDescription"
+            args={<PeerTitleTsx peerId={props.peerId} onlyFirstName={props.peer._ === 'user'} />}
+          />
+        </MediaHeader.Subtitle>
+      </MediaHeader>
       <div class={styles.premiumOptionsContainer}>
         <For each={props.premiumOptions}>
           {(option) => {
             return (
-              <div class={styles.premiumOption} onClick={() => props.onGiftChosen(option)}>
+              <div class={styles.premiumOption} role="button" tabindex={Modes.a11y ? 0 : undefined} onClick={() => props.onGiftChosen(option)} onKeyDown={buttonKeyDown}>
                 <LottieAnimation
                   lottieLoader={lottieLoader}
                   class={styles.premiumOptionSticker}
@@ -153,7 +159,7 @@ function GiftOptionsPage(props: {
                     class={styles.premiumOptionBadge}
                     textClass={styles.premiumOptionBadgeText}
                   >
-                      -{Math.round(option.discountPercent)}%
+                      <span dir="ltr">-{Math.round(option.discountPercent)}%</span>
                   </StarGiftBadge>
                 )}
 
@@ -179,7 +185,7 @@ function GiftOptionsPage(props: {
     setCategory(it as CategoryName);
 
     fastRaf(() => {
-      container.scrollTo({top: categoriesContainer.offsetTop - 56, behavior: wasPinned ? 'instant' : 'smooth'});
+      container.scrollTo({top: categoriesContainer.offsetTop - 56, behavior: wasPinned ? 'instant' : smoothScrollBehavior()});
     });
   }
 
@@ -211,12 +217,12 @@ function GiftOptionsPage(props: {
 
     const gift = item.raw as StarGift.starGift;
     if(gift.availability_remains === 0 && !gift.resell_min_stars) {
-      PopupElement.createPopup(PopupStarGiftInfo, {gift: item});
+      showStarGiftInfoPopup({gift: item});
       return;
     }
 
     if(gift.pFlags.require_premium && !rootScope.premium) {
-      PopupPremium.show();
+      hotReloadGuard.showPremiumPopup();
       return;
     }
 
@@ -226,9 +232,7 @@ function GiftOptionsPage(props: {
     }
 
     if(gift.locked_until_date > tsNow(true)) {
-      const result = await rootScope.managers.apiManager.invokeApi('payments.checkCanSendGift', {
-        gift_id: gift.id
-      })
+      const result = await rootScope.managers.appGiftsManager.checkCanSendGift(gift.id)
 
       if(result._ === 'payments.checkCanSendGiftResultFail') {
         confirmationPopup({
@@ -266,7 +270,7 @@ function GiftOptionsPage(props: {
     >
       <div class={styles.mainContainer}>
         <div class={styles.mainHeader}>
-          <ButtonIconTsx icon="close" onClick={props.onClose} />
+          <ButtonIconTsx icon="close" aria-label={I18n.format('Close', true)} onClick={props.onClose} />
           <div class="popup-title">
             {i18n('StarGiftSendGift')}
           </div>
@@ -276,21 +280,24 @@ function GiftOptionsPage(props: {
           <img
             class={styles.recipientBackground}
             src={`assets/img/${maybe2x('stars_pay')}.png`}
+            alt=""
           />
           <AvatarNewTsx peerId={props.peerId} size={100} />
         </div>
 
         {giftPremiumSection}
 
-        <div class={styles.mainTitle}>
-          {isToSelf ? i18n('StarGiftSendGiftSelf') : i18n('StarGiftSendGift')}
-        </div>
-        <div class={styles.mainSubtitle}>
-          <I18nTsx
-            key={isToSelf ? 'SendStarGiftSubtitleSelf' : 'SendStarGiftSubtitle'}
-            args={isToSelf ? undefined : [<PeerTitleTsx peerId={props.peerId} onlyFirstName={props.peer._ === 'user'} />]}
-          />
-        </div>
+        <MediaHeader class={styles.intro}>
+          <MediaHeader.Title>
+            {isToSelf ? i18n('StarGiftSendGiftSelf') : i18n('StarGiftSendGift')}
+          </MediaHeader.Title>
+          <MediaHeader.Subtitle>
+            <I18nTsx
+              key={isToSelf ? 'SendStarGiftSubtitleSelf' : 'SendStarGiftSubtitle'}
+              args={isToSelf ? undefined : [<PeerTitleTsx peerId={props.peerId} onlyFirstName={props.peer._ === 'user'} />]}
+            />
+          </MediaHeader.Subtitle>
+        </MediaHeader>
 
         <ChipTabs
           value={category()}
@@ -359,6 +366,7 @@ function ResaleOptionsPage(props: {
 }) {
   const [total, setTotal] = createSignal<Long | null>(null);
   const [sort, setSort] = createSignal<'price' | 'date' | 'num'>('price');
+  const [sortPopupVisible, setSortPopupVisible] = createSignal(false);
   const [items, setItems] = createSignal<MyStarGift[]>([]);
   const [loading, setLoading] = createSignal(true);
 
@@ -517,6 +525,7 @@ function ResaleOptionsPage(props: {
         <div class={styles.resaleHeaderInner}>
           <ButtonIconTsx
             icon={props.isFirst ? 'close' : 'back'}
+            aria-label={I18n.format('Close', true)}
             onClick={props.isFirst ? props.onClose : props.onBack}
           />
           <div class={`popup-title ${styles.resaleTitle}`}>
@@ -532,13 +541,19 @@ function ResaleOptionsPage(props: {
           <Scrollable axis="x">
             <div
               class={`${styles.resaleFilterChip} ${styles.resaleFilterChipSort} btn-menu-toggle`}
+              role="button"
+              tabindex={Modes.a11y ? 0 : undefined}
+              aria-haspopup="menu"
+              aria-expanded={sortPopupVisible()}
               ref={(el) => {
                 ButtonMenuToggle({
                   container: el,
                   appendTo: getOverlayRoot(),
                   onOpen: (e, menu) => {
+                    setSortPopupVisible(true);
                     positionMenuTrigger(el, menu, 'bottom-right', {top: 8})
                   },
+                  onClose: () => setSortPopupVisible(false),
                   direction: 'bottom-right',
                   buttons: [
                     {
@@ -565,7 +580,6 @@ function ResaleOptionsPage(props: {
             </div>
 
             <ButtonMenuSelect<StarGiftAttribute.starGiftAttributeModel>
-              class={styles.resaleFilterSelect}
               value={chosenModelOptions()}
               onValueChange={setChosenModelOptions}
               options={modelOptions()}
@@ -599,7 +613,14 @@ function ResaleOptionsPage(props: {
               onToggleMenu={setModelPopupVisible}
               direction="bottom-right"
             >
-              <div class={styles.resaleFilterChip}>
+              <div
+                class={styles.resaleFilterChip}
+                role="button"
+                tabindex={Modes.a11y ? 0 : undefined}
+                aria-haspopup="menu"
+                aria-expanded={modelPopupVisible()}
+                onKeyDown={buttonKeyDown}
+              >
                 <I18nTsx
                   key={hasChosenModelOptions() ? 'StarGiftNModels' : 'StarGiftModel'}
                   args={[String(chosenModelOptions().length)]}
@@ -609,7 +630,6 @@ function ResaleOptionsPage(props: {
             </ButtonMenuSelect>
 
             <ButtonMenuSelect<StarGiftAttribute.starGiftAttributeBackdrop>
-              class={styles.resaleFilterSelect}
               value={chosenBackdropOptions()}
               onValueChange={setChosenBackdropOptions}
               options={backdropOptions()}
@@ -643,7 +663,14 @@ function ResaleOptionsPage(props: {
               onToggleMenu={setBackdropPopupVisible}
               direction="bottom-left"
             >
-              <div class={styles.resaleFilterChip}>
+              <div
+                class={styles.resaleFilterChip}
+                role="button"
+                tabindex={Modes.a11y ? 0 : undefined}
+                aria-haspopup="menu"
+                aria-expanded={backdropPopupVisible()}
+                onKeyDown={buttonKeyDown}
+              >
                 <I18nTsx
                   key={hasChosenBackdropOptions() ? 'StarGiftNBackdrops' : 'StarGiftBackdrop'}
                   args={[String(chosenBackdropOptions().length)]}
@@ -653,7 +680,6 @@ function ResaleOptionsPage(props: {
             </ButtonMenuSelect>
 
             <ButtonMenuSelect<StarGiftAttribute.starGiftAttributePattern>
-              class={styles.resaleFilterSelect}
               value={chosenPatternOptions()}
               onValueChange={setChosenPatternOptions}
               options={patternOptions()}
@@ -688,7 +714,14 @@ function ResaleOptionsPage(props: {
               onToggleMenu={setPatternPopupVisible}
               direction="bottom-left"
             >
-              <div class={styles.resaleFilterChip}>
+              <div
+                class={styles.resaleFilterChip}
+                role="button"
+                tabindex={Modes.a11y ? 0 : undefined}
+                aria-haspopup="menu"
+                aria-expanded={patternPopupVisible()}
+                onKeyDown={buttonKeyDown}
+              >
                 <I18nTsx
                   key={hasChosenPatternOptions() ? 'StarGiftNPatterns' : 'StarGiftPattern'}
                   args={[String(chosenPatternOptions().length)]}
@@ -718,7 +751,7 @@ function ResaleOptionsPage(props: {
                 scrollParent={container}
                 autoplay={false} // ! todo: need shared canvas for decent performance
                 onClick={(item) => {
-                  const popup = PopupElement.createPopup(PopupStarGiftInfo, {
+                  const popup = showStarGiftInfoPopup({
                     gift: item,
                     resaleRecipient: props.peerId,
                     onClickAway: props.onClose,
@@ -752,7 +785,6 @@ function StarGiftLimitedProgress(props: {
 }) {
   // NB: deliberately not reactive, gift won't change
   const left = i18n('StarGiftLimitedLeft', [props.gift.availability_remains]);
-  left.classList.add(styles.limitedProgressLeft);
 
   const progress = 100 * props.gift.availability_remains / props.gift.availability_total;
 
@@ -761,7 +793,8 @@ function StarGiftLimitedProgress(props: {
       <div class={styles.limitedProgressBar}>
         <div class={styles.limitedProgressProgress} style={{width: `${100 * props.gift.availability_remains / props.gift.availability_total}%`}} />
         <div class={styles.limitedProgressText} style={{
-          'background-image': `linear-gradient(90deg, #fff ${progress}%, var(--secondary-text-color) ${progress}%)`
+          // * the fill grows from the inline start, and the text over it turns white with it
+          'background-image': `linear-gradient(calc(90deg * var(--reflect)), #fff ${progress}%, var(--secondary-text-color) ${progress}%)`
         }}>
           {left}
           {i18n('StarGiftLimitedSold2', [props.gift.availability_total - props.gift.availability_remains])}
@@ -806,10 +839,11 @@ function ChosenGiftPage(props: {
   }));
 
   async function handleSubmit() {
+    const managers = bindManagersToSession(rootScope.managers);
     setSending(true);
     let invoice: InputInvoice;
     if(props.chosenGift.type === 'stargift') {
-      const peer = await rootScope.managers.appPeersManager.getInputPeerById(props.peerId)
+      const peer = await managers.appPeersManager.getInputPeerById(props.peerId)
       invoice = {
         _: 'inputInvoiceStarGift',
         pFlags: {
@@ -822,7 +856,7 @@ function ChosenGiftPage(props: {
       };
     } else {
       const payWithStars$ = payWithStars();
-      const inputUser = await rootScope.managers.appUsersManager.getUserInput(props.peerId.toUserId());
+      const inputUser = await managers.appUsersManager.getUserInput(props.peerId.toUserId());
       if(payWithStars$) {
         invoice = {
           _: 'inputInvoicePremiumGiftStars',
@@ -846,7 +880,7 @@ function ChosenGiftPage(props: {
     }
 
     try {
-      const popup = await PopupPayment.create({
+      const popup = await createPaymentPopup({
         inputInvoice: invoice,
         noShowIfStars: true,
         purpose: 'stargift'
@@ -881,6 +915,7 @@ function ChosenGiftPage(props: {
       <div class={styles.secondPageHeader}>
         <ButtonIconTsx
           icon="back"
+          aria-label={I18n.format('StarsRating.Back', true)}
           onClick={props.onBack}
         />
         <div class="popup-title">
@@ -925,6 +960,10 @@ function ChosenGiftPage(props: {
               class={styles.formInput}
               placeholder='StarGiftMessagePlaceholder'
               instanceRef={(input) => {
+                input.input.setAttribute('aria-label', I18n.format('StarGiftMessagePlaceholder', true))
+                // The message travels as text plus entities and holds one line.
+                const editor = attachPlainMessageEditor(input.input);
+                onCleanup(() => editor.destroy());
                 input.input.addEventListener('input', () => {
                   const value = getRichValueWithCaret(input.input, true)
                   setTextWithEntities(value.value ? {
@@ -1059,177 +1098,155 @@ function ChosenGiftPage(props: {
   )
 }
 
-export default class PopupSendGift extends PopupElement {
-  private chosenGift: Accessor<MyStarGift | MyPremiumGiftOption | undefined>;
-  private setChosenGift: Setter<MyStarGift | MyPremiumGiftOption>;
-
-  readonly peerId: PeerId;
-  readonly birthday?: boolean;
-  readonly resaleParams?: {
+export default async function showSendGiftPopup(options: {
+  peerId: PeerId;
+  birthday?: boolean;
+  resaleParams?: {
     giftId: Long;
     filter?: StarGiftAttribute;
     title?: string;
   };
+}) {
+  const managers = bindManagersToSession(rootScope.managers);
+  const {peerId, birthday, resaleParams} = options;
+  const [show, setShow] = createSignal(true);
+  let containerEl!: HTMLDivElement;
 
-  constructor(options: {
-    peerId: PeerId;
-    birthday?: boolean;
-    resaleParams?: PopupSendGift['resaleParams'];
-  }) {
-    super(styles.popup, {
-      title: 'StarGiftSendGift',
-      closable: true,
-      overlayClosable: true,
-      body: true,
-      onBackClick: () => {
-        if(this.chosenGift()) {
-          this.setChosenGift(undefined);
-        }
-      }
-    });
+  const [profileStore, profileStoreActions] = createProfileGiftsStore({
+    peerId: rootScope.myId,
+    initialFilters: {
+      unlimited: false,
+      limited: false,
+      upgradable: false
+    }
+  })
+  const [loadedPremiumOptions, loadedGiftOptions, peer, cachedBirthdayNearby, userFull] = await Promise.all([
+    peerId.isUser() ? rootScope.managers.appGiftsManager.getPremiumGiftOptions() : [] as MyPremiumGiftOption[],
+    rootScope.managers.appGiftsManager.getStarGiftOptions(),
+    rootScope.managers.appPeersManager.getPeer(peerId),
+    peerId.isUser() ? rootScope.managers.appPromoManager.isCachedBirthdayNearby(peerId).catch(() => false) : false,
+    peerId.isUser() && peerId !== rootScope.myId ?
+      rootScope.managers.appProfileManager.getProfile(peerId.toUserId()).catch((): undefined => undefined) : undefined,
+    !resaleParams && peerId !== rootScope.myId && profileStoreActions.loadNext()
+  ]);
+  const disallowedGifts = userFull?.disallowed_gifts?.pFlags;
+  const premiumOptions = disallowedGifts?.disallow_premium_gifts ? [] : loadedPremiumOptions;
+  const allowedGiftOptions = loadedGiftOptions.filter((gift) => isStarGiftAllowed(gift, disallowedGifts));
+  const allowedOwnedGifts = unwrap(profileStore.items).filter((gift) => isStarGiftAllowed(gift, disallowedGifts));
+  const isBirthday = birthday || cachedBirthdayNearby || isBirthdayNearby(userFull?.birthday);
+  const giftOptions = isBirthday ? prioritizeBirthdayGifts(allowedGiftOptions) : allowedGiftOptions;
+  const hasAvailableGift = premiumOptions.length > 0 ||
+    giftOptions.length > 0 ||
+    allowedOwnedGifts.length > 0;
 
-    safeAssign(this, options);
-
-    this.construct();
+  if(!resaleParams && peer._ === 'user' && peerId !== rootScope.myId && !hasAvailableGift) {
+    setShow(false);
+    toastNew({langPackKey: 'GiftRecipientDoesNotAccept'});
+    return;
   }
 
-  private async construct() {
-    const [profileStore, profileStoreActions] = createProfileGiftsStore({
-      peerId: rootScope.myId,
-      initialFilters: {
-        unlimited: false,
-        limited: false,
-        upgradable: false
-      }
-    })
-    const [loadedPremiumOptions, loadedGiftOptions, peer, cachedBirthdayNearby, userFull] = await Promise.all([
-      this.peerId.isUser() ? this.managers.appGiftsManager.getPremiumGiftOptions() : [] as MyPremiumGiftOption[],
-      this.managers.appGiftsManager.getStarGiftOptions(),
-      this.managers.appPeersManager.getPeer(this.peerId),
-      this.peerId.isUser() ? this.managers.appPromoManager.isCachedBirthdayNearby(this.peerId).catch(() => false) : false,
-      this.peerId.isUser() && this.peerId !== rootScope.myId ?
-        this.managers.appProfileManager.getProfile(this.peerId.toUserId()).catch((): undefined => undefined) : undefined,
-      !this.resaleParams && this.peerId !== rootScope.myId && profileStoreActions.loadNext()
-    ]);
-    const disallowedGifts = userFull?.disallowed_gifts?.pFlags;
-    const premiumOptions = disallowedGifts?.disallow_premium_gifts ? [] : loadedPremiumOptions;
-    const allowedGiftOptions = loadedGiftOptions.filter((gift) => isStarGiftAllowed(gift, disallowedGifts));
-    const allowedOwnedGifts = unwrap(profileStore.items).filter((gift) => isStarGiftAllowed(gift, disallowedGifts));
-    const isBirthday = this.birthday || cachedBirthdayNearby || isBirthdayNearby(userFull?.birthday);
-    const giftOptions = isBirthday ? prioritizeBirthdayGifts(allowedGiftOptions) : allowedGiftOptions;
-    const hasAvailableGift = premiumOptions.length > 0 ||
-      giftOptions.length > 0 ||
-      allowedOwnedGifts.length > 0;
-
-    if(!this.resaleParams && peer._ === 'user' && this.peerId !== rootScope.myId && !hasAvailableGift) {
-      this.hide();
+  const [chosenGift, setChosenGift] = createSignal<GiftOption>();
+  if(resaleParams) {
+    const selectedGift = giftOptions.find((it) => it.raw.id === resaleParams.giftId && it.isResale);
+    if(!selectedGift && disallowedGifts &&
+      loadedGiftOptions.some((it) => it.raw.id === resaleParams.giftId && it.isResale)) {
+      setShow(false);
       toastNew({langPackKey: 'GiftRecipientDoesNotAccept'});
       return;
     }
 
-    const [chosenGift, setChosenGift] = createSignal<GiftOption>();
-    if(this.resaleParams) {
-      const selectedGift = giftOptions.find((it) => it.raw.id === this.resaleParams!.giftId && it.isResale);
-      if(!selectedGift && disallowedGifts &&
-        loadedGiftOptions.some((it) => it.raw.id === this.resaleParams!.giftId && it.isResale)) {
-        this.hide();
-        toastNew({langPackKey: 'GiftRecipientDoesNotAccept'});
-        return;
+    setChosenGift(selectedGift || {
+      isResale: true,
+      type: 'stargift',
+      raw: {
+        _: 'starGift',
+        id: resaleParams.giftId,
+        title: resaleParams.title || 'Star Gift',
+        availability_total: 0,
+        availability_remains: 0,
+        first_sale_date: 0,
+        last_sale_date: 0,
+        stars: 0 as any,
+        sticker: {} as any
       }
-
-      setChosenGift(selectedGift || {
-        isResale: true,
-        type: 'stargift',
-        raw: {
-          _: 'starGift',
-          id: this.resaleParams.giftId,
-          title: this.resaleParams.title || 'Star Gift',
-          availability_total: 0,
-          availability_remains: 0,
-          first_sale_date: 0,
-          last_sale_date: 0,
-          stars: 0 as any,
-          sticker: {} as any
-        }
-      } as unknown as MyStarGift);
-    }
-    this.chosenGift = chosenGift;
-    this.setChosenGift = setChosenGift;
-
-    const [currentPage, setCurrentPage] = createSignal(this.resaleParams ? 2 : 0);
-
-    const secondPageNavigationItem: NavigationItem = {
-      type: 'left',
-      onPop: () => void setCurrentPage(0)
-    }
-
-    onCleanup(() => {
-      appNavigationController.removeItem(secondPageNavigationItem);
-    });
-
-    this.container.replaceChildren();
-    const dispose = render(() => (
-      <>
-        <TransitionSliderTsx
-          type="navigation"
-          transitionTime={150}
-          animateFirst={false}
-          onTransitionStart={(id) => {
-            this.container.classList.toggle(styles.isChosenGift, id === 1);
-
-            if(id === 0) {
-              appNavigationController.removeItem(secondPageNavigationItem);
-            } else {
-              appNavigationController.pushItem(secondPageNavigationItem);
-            }
-          }}
-          onTransitionEnd={(id) => {
-            if(id === 0) {
-              this.setChosenGift(undefined);
-            }
-          }}
-          currentPage={currentPage()}
-        >
-          <GiftOptionsPage
-            peer={peer as User.user | Chat.channel}
-            peerId={this.peerId}
-            premiumOptions={premiumOptions}
-            giftOptions={giftOptions}
-            disallowedGifts={disallowedGifts}
-            onGiftChosen={(option) => {
-              setChosenGift(option);
-              setCurrentPage((option as MyStarGift).isResale ? 2 : 1);
-            }}
-            onClose={() => this.hide()}
-            profileStore={profileStore}
-            profileStoreActions={profileStoreActions}
-          />
-          <Show when={chosenGift() !== undefined && !(chosenGift() as MyStarGift).isResale}>
-            <ChosenGiftPage
-              peerId={this.peerId}
-              peerName={peer._ === 'user' ? peer.first_name : peer.title}
-              chosenGift={chosenGift()}
-              disallowedGifts={disallowedGifts}
-              onBack={() => setCurrentPage(0)}
-              onClose={() => this.hide()}
-            />
-          </Show>
-          <Show when={chosenGift() !== undefined && (chosenGift() as MyStarGift).isResale}>
-            <ResaleOptionsPage
-              gift={chosenGift() as MyStarGift}
-              peerId={this.peerId}
-              isFirst={this.resaleParams !== undefined}
-              onBack={() => setCurrentPage(0)}
-              onClose={() => this.hide()}
-              initialFilter={this.resaleParams?.filter}
-            />
-          </Show>
-        </TransitionSliderTsx>
-        <FloatingStarsBalance class={styles.starsBalance} />
-      </>
-    ), this.container);
-
-    this.addEventListener('closeAfterTimeout', dispose);
-    this.show();
+    } as unknown as MyStarGift);
   }
+
+  const [currentPage, setCurrentPage] = createSignal(resaleParams ? 2 : 0);
+
+  const secondPageNavigationItem: NavigationItem = {
+    type: 'left',
+    onPop: () => void setCurrentPage(0)
+  }
+
+  onCleanup(() => {
+    appNavigationController.removeItem(secondPageNavigationItem);
+  });
+
+  createPopup(() => (
+    <PopupElement
+      managers={managers}
+      class={styles.popup}
+      closable
+      show={show()}
+      containerProps={{ref: (element) => containerEl = element}}
+    >
+      <TransitionSliderTsx
+        type="navigation"
+        transitionTime={150}
+        animateFirst={false}
+        onTransitionStart={(id) => {
+          containerEl.classList.toggle(styles.isChosenGift, id === 1);
+
+          if(id === 0) {
+            appNavigationController.removeItem(secondPageNavigationItem);
+          } else {
+            appNavigationController.pushItem(secondPageNavigationItem);
+          }
+        }}
+        onTransitionEnd={(id) => {
+          if(id === 0) {
+            setChosenGift(undefined);
+          }
+        }}
+        currentPage={currentPage()}
+      >
+        <GiftOptionsPage
+          peer={peer as User.user | Chat.channel}
+          peerId={peerId}
+          premiumOptions={premiumOptions}
+          giftOptions={giftOptions}
+          disallowedGifts={disallowedGifts}
+          onGiftChosen={(option) => {
+            setChosenGift(option);
+            setCurrentPage((option as MyStarGift).isResale ? 2 : 1);
+          }}
+          onClose={() => setShow(false)}
+          profileStore={profileStore}
+          profileStoreActions={profileStoreActions}
+        />
+        <Show when={chosenGift() !== undefined && !(chosenGift() as MyStarGift).isResale}>
+          <ChosenGiftPage
+            peerId={peerId}
+            peerName={peer._ === 'user' ? peer.first_name : peer.title}
+            chosenGift={chosenGift()}
+            disallowedGifts={disallowedGifts}
+            onBack={() => setCurrentPage(0)}
+            onClose={() => setShow(false)}
+          />
+        </Show>
+        <Show when={chosenGift() !== undefined && (chosenGift() as MyStarGift).isResale}>
+          <ResaleOptionsPage
+            gift={chosenGift() as MyStarGift}
+            peerId={peerId}
+            isFirst={resaleParams !== undefined}
+            onBack={() => setCurrentPage(0)}
+            onClose={() => setShow(false)}
+            initialFilter={resaleParams?.filter}
+          />
+        </Show>
+      </TransitionSliderTsx>
+      <FloatingStarsBalance class={styles.starsBalance} />
+    </PopupElement>
+  ));
 }

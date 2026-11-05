@@ -5,6 +5,7 @@
 
 import {logger} from '@lib/logger';
 import ByteBuf from '@lib/calls/p2P/byteBuf';
+import {crc32c} from '@helpers/number/crc32';
 
 const DEBUG_CALLS = true;
 const log = logger('CALL-SCTP');
@@ -40,8 +41,6 @@ const SCTP_COOKIE_ECHO = 10;
 const SCTP_COOKIE_ACK = 11;
 const SCTP_DATA = 0;
 
-const CRC32C_TABLE = createCrc32cTable();
-
 export class SctpSignaling {
   private localTag = generateUint32();
 
@@ -57,7 +56,7 @@ export class SctpSignaling {
 
   private initSent = false;
 
-  private initSentAt = 0;
+  private initSentAt: number | undefined;
 
   private initRetryCount = 0;
 
@@ -74,6 +73,7 @@ export class SctpSignaling {
   private pendingPeerDataSize = 0;
 
   private reassembly?: ByteBuf[];
+  private reassemblySize = 0;
 
   wrapPayload(payload: ByteBuf) {
     if(this.isEstablished && this.peerTag !== undefined) {
@@ -97,11 +97,11 @@ export class SctpSignaling {
   }
 
   private shouldRetryInit() {
-    if(!this.initSentAt || this.peerTag !== undefined) {
+    if(this.initSentAt === undefined || this.peerTag !== undefined) {
       return false;
     }
 
-    return Date.now() - this.initSentAt >= this.getInitRetryDelay();
+    return performance.now() - this.initSentAt >= this.getInitRetryDelay();
   }
 
   private getInitRetryDelay() {
@@ -114,7 +114,7 @@ export class SctpSignaling {
 
   private createInitRetryPacket() {
     this.initSent = true;
-    this.initSentAt = Date.now();
+    this.initSentAt = performance.now();
     this.initRetryCount++;
     return Array.from(this.createInitPacket());
   }
@@ -327,6 +327,7 @@ export class SctpSignaling {
 
     if(isBegin) {
       this.reassembly = [userData];
+      this.reassemblySize = userData.length;
       return undefined;
     }
 
@@ -339,12 +340,31 @@ export class SctpSignaling {
     }
 
     this.reassembly.push(userData);
+    this.reassemblySize += userData.length;
+
+    // Bound the run. Inbound signaling is SCTP-framed BEFORE it can be
+    // authenticated (processDecryptQueue reassembles, then decrypts), so a peer
+    // — or the relay, which delivers updateNewCallSignalingData — can stream
+    // middle fragments that never set the E flag and grow this buffer until the
+    // tab dies. Same budget the pending-chunk map above already uses.
+    if(this.reassembly.length > SCTP_MAX_PENDING_PEER_DATA_CHUNKS ||
+      this.reassemblySize > SCTP_MAX_PENDING_PEER_DATA_BYTES) {
+      logSctp('DATA reassembly overflow, dropping run', {
+        chunks: this.reassembly.length,
+        bytes: this.reassemblySize
+      });
+      this.reassembly = undefined;
+      this.reassemblySize = 0;
+      return undefined;
+    }
+
     if(!isEnd) {
       return undefined;
     }
 
     const result = ByteBuf.concat(this.reassembly);
     this.reassembly = undefined;
+    this.reassemblySize = 0;
     return result;
   }
 
@@ -451,7 +471,7 @@ export class SctpSignaling {
     this.peerInitialTsn = undefined;
     this.peerCumulativeTsn = undefined;
     this.initSent = false;
-    this.initSentAt = 0;
+    this.initSentAt = undefined;
     this.initRetryCount = 0;
     this.isEstablished = false;
     this.cookie = ByteBuf.alloc(0);
@@ -459,6 +479,7 @@ export class SctpSignaling {
     this.pendingPackets = [];
     this.clearPendingPeerData();
     this.reassembly = undefined;
+    this.reassemblySize = 0;
   }
 
   private createInitPacket() {
@@ -513,7 +534,7 @@ export class SctpSignaling {
     packet.writeUInt16BE(SCTP_PORT, 2);
     packet.writeUInt32BE(verificationTag, 4);
     chunk.copy(packet, 12);
-    packet.writeUInt32LE(crc32c(packet), 8);
+    packet.writeUInt32LE(sctpChecksum(packet), 8);
     return packet;
   }
 
@@ -595,7 +616,7 @@ export function isSctpPacket(packet: ByteBuf) {
 }
 
 function hasValidSctpChecksum(packet: ByteBuf) {
-  return isSctpPacket(packet) && packet.readUInt32LE(8) === crc32c(packet);
+  return isSctpPacket(packet) && packet.readUInt32LE(8) === sctpChecksum(packet);
 }
 
 function align4(value: number) {
@@ -617,26 +638,11 @@ function getForwardTsnGap(tsn: number, expectedTsn: number) {
   return (tsn - expectedTsn) >>> 0;
 }
 
-function createCrc32cTable() {
-  const table: number[] = [];
-  for(let i = 0; i < 256; i++) {
-    let value = i;
-    for(let bit = 0; bit < 8; bit++) {
-      value = value & 1 ? (0x82F63B78 ^ (value >>> 1)) : value >>> 1;
-    }
-    table[i] = value >>> 0;
-  }
-  return table;
-}
-
-function crc32c(data: ByteBuf) {
+// * the checksum is taken over the packet with its own field zeroed
+function sctpChecksum(data: ByteBuf) {
   const buffer = ByteBuf.wrap(data);
   buffer.writeUInt32LE(0, 8);
-  let crc = 0xFFFFFFFF;
-  for(let i = 0; i < buffer.length; i++) {
-    crc = CRC32C_TABLE[(crc ^ buffer[i]) & 0xFF] ^ (crc >>> 8);
-  }
-  return (~crc) >>> 0;
+  return crc32c(buffer);
 }
 
 function logSctp(message: string, data: Record<string, unknown> = {}) {

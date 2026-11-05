@@ -1,7 +1,6 @@
 import {
   createSignal,
   createMemo,
-  createRenderEffect,
   Show,
   createEffect,
   createRoot,
@@ -13,19 +12,31 @@ import {
 } from 'solid-js';
 
 import LoadingDialogSkeleton, {LoadingDialogSkeletonSize} from '@components/loadingDialogSkeleton';
-import VerticalVirtualList, {VerticalVirtualListItemProps} from '@components/verticalVirtualList';
-
-import styles from '@components/deferredSortedVirtualList.module.scss';
+import VerticalVirtualList, {createItemGlide, createItemsLayout, VerticalVirtualListItemProps, VIRTUAL_LIST_ITEM_CLASS_NAME} from '@components/verticalVirtualList';
 
 
 type CreateDeferredSortedVirtualListArgs<T> = {
   scrollable: HTMLElement,
   getItemElement: (item: T, id: any) => HTMLElement,
+  // * The row is in the list now - the one moment its place in the DOM can be relied upon: an item
+  // * is built before it is ever mounted (the list loads ahead of the scroll), and a row that is
+  // * remounted may have missed whatever the list went through while it was out
+  onItemMount?: (item: T, element: HTMLElement) => void,
   onItemUnmount?: (item: T) => void,
+  // * Unlike onItemUnmount (the row merely left the rendered window and is kept for re-mounting),
+  // * this fires when the list drops the item for good - removed, trimmed by checkShrink, cleared or
+  // * disposed - and the owner will never see it again. Without it an owner that allocates per-item
+  // * resources (middleware, players, canvases) has no point at which to release them.
+  onItemDiscard?: (item: T) => void,
   onListShrinked: () => void,
   requestItemForIdx: (idx: number, itemsLength: number) => void,
   sortWith: (a: number, b: number) => number,
   itemSize: LoadingDialogSkeletonSize,
+  /**
+   * How tall an item is, for a list whose items are not all `itemSize` tall - read in a tracking
+   * scope, so a height that changes lays the list out again. An item still loading is `itemSize`
+   */
+  getItemHeight?: (item: T) => number,
   noAvatar?: boolean,
   onListLengthChange?: () => void,
   extraPaddingBottom?: number
@@ -65,11 +76,14 @@ export const createDeferredSortedVirtualList = <T, >(args: CreateDeferredSortedV
   const {
     scrollable,
     getItemElement,
+    onItemMount,
     onItemUnmount,
+    onItemDiscard,
     onListShrinked,
     requestItemForIdx,
     sortWith,
     itemSize,
+    getItemHeight,
     onListLengthChange,
     noAvatar,
     extraPaddingBottom = 8
@@ -100,6 +114,12 @@ export const createDeferredSortedVirtualList = <T, >(args: CreateDeferredSortedV
     .map((_, idx) => realItems[idx] || null);
   });
 
+  const layout = getItemHeight && createMemo(() => {
+    return createItemsLayout(fullItems(), (item: DeferredSortedVirtualListItem<T>) => {
+      return item ? getItemHeight(item.value) : itemSize;
+    });
+  });
+
   const itemsLength = createMemo(() => items().length);
 
   createEffect(() => {
@@ -115,22 +135,36 @@ export const createDeferredSortedVirtualList = <T, >(args: CreateDeferredSortedV
     setRevealIdx(items().length);
   }));
 
+  // * Re-adding an id replaces the value behind it, so the previous one is dropped for good - unless
+  // * it is the very same object being re-added, which is the common no-op case
+  const replacedBy = (
+    previous: DeferredSortedVirtualListItem<T>[],
+    newItems: DeferredSortedVirtualListItem<T>[]
+  ) => {
+    const values = new Map(newItems.map(item => [item.id, item.value]));
+    return previous.filter(item => values.has(item.id) && values.get(item.id) !== item.value);
+  };
+
   const addItems = (newItems: DeferredSortedVirtualListItem<T>[]) => {
     if(!newItems.length) return;
     const ids = new Set(newItems.map(item => item.id));
+    const replaced = replacedBy(items(), newItems);
     setItems(prev => [
       ...prev.filter(item => !ids.has(item.id)),
       ...newItems
     ]);
+    discard(replaced);
   };
 
   const addPinnedItems = (newItems: DeferredSortedVirtualListItem<T>[]) => {
     if(!newItems.length) return;
     const ids = new Set(newItems.map(item => item.id));
+    const replaced = replacedBy(pinnedItems(), newItems);
     setPinnedItems(prev => [
       ...prev.filter(item => !ids.has(item.id)),
       ...newItems
     ]);
+    discard(replaced);
   };
 
   /**
@@ -148,14 +182,32 @@ export const createDeferredSortedVirtualList = <T, >(args: CreateDeferredSortedV
     });
   };
 
-  const removePinnedItem = (id: any) => {
-    setPinnedItems(prev => prev.filter(item => id !== item.id));
+  const discard = (discarded: DeferredSortedVirtualListItem<T>[]) => {
+    if(!onItemDiscard) return;
+    for(const item of discarded) onItemDiscard(item.value);
   };
 
+  // * Both bail before writing when the id is not theirs: the setter would hand back a fresh array
+  // * either way, invalidating the signal and every memo over it (itemsMap, the rendered list) for a
+  // * removal that did not happen. delete() calls both on every key, so one of them always misses.
+  const removePinnedItem = (id: any) => {
+    const discarded = pinnedItems().filter(item => id === item.id);
+    if(!discarded.length) return false;
+
+    setPinnedItems(prev => prev.filter(item => id !== item.id));
+    discard(discarded);
+    return true;
+  };
+
+  // * Reports what it actually removed. It used to answer from itemsMap(), which merges the pinned
+  // * collection in, so a pinned id got a truthy answer from a call that removed nothing.
   const removeItem = (id: any) => {
-    const hadItem = itemsMap().has(id);
+    const discarded = items().filter(item => id === item.id);
+    if(!discarded.length) return false;
+
     setItems(prev => prev.filter(item => id !== item.id));
-    return hadItem;
+    discard(discarded);
+    return true;
   };
 
   const updateItem = (id: any, index: number) => {
@@ -175,6 +227,7 @@ export const createDeferredSortedVirtualList = <T, >(args: CreateDeferredSortedV
   };
 
   const clear = () => {
+    const discarded = [...pinnedItems(), ...items()];
     batch(() => {
       setItems([]);
       setPinnedItems([]);
@@ -184,16 +237,17 @@ export const createDeferredSortedVirtualList = <T, >(args: CreateDeferredSortedV
       blockedAnimationCallbacks.clear();
       setBlockedAnimationCount(0);
     });
+    discard(discarded);
     // onListLengthChange?.();
   };
 
 
   let list: HTMLUListElement;
 
-  const InnerItem = (props: {id: any, value: T, top: number, animating: boolean}) => {
+  const InnerItem = (props: {id: any, value: T, top: number, glide: boolean}) => {
     const element = createMemo(() => {
       const element = getItemElement(props.value, props.id);
-      element?.classList.add(styles.Item);
+      element?.classList.add(VIRTUAL_LIST_ITEM_CLASS_NAME);
 
       onCleanup(() => {
         onItemUnmount?.(props.value);
@@ -202,12 +256,16 @@ export const createDeferredSortedVirtualList = <T, >(args: CreateDeferredSortedV
       return element;
     });
 
-    createRenderEffect(() => {
-      element()?.style.setProperty('top', props.top + 'px');
+    // * effects run once the rendered nodes are in the document, so the row is inside the list here
+    createEffect(() => {
+      const _element = element();
+      if(_element) untrack(() => onItemMount?.(props.value, _element));
     });
 
+    const gliding = createItemGlide(element, () => props.top, () => props.glide);
+
     createEffect(() => {
-      if(props.animating)
+      if(gliding())
         element()?.style.setProperty('--background', /* 'red' */'var(--surface-color)');
       else
         element()?.style.removeProperty('--background');
@@ -245,11 +303,14 @@ export const createDeferredSortedVirtualList = <T, >(args: CreateDeferredSortedV
     const toKeep = maxVisible - pinnedItems().length + EXTRA_ITEMS_TO_KEEP;
 
     if(itemsLength > toKeep) {
+      // The trimmed tail is dropped for good - hand it to the owner before it goes out of reach
+      const discarded = sortedItems().slice(toKeep);
       batch(() => {
         // Should be sortedItems() here, because the updated cursor is based on the last item from the list, and might skip a few dialogs if wasn't set the right cursor
         setItems(sortedItems().slice(0, toKeep));
         setRevealIdx(toKeep);
       });
+      discard(discarded);
       onListShrinked();
     }
   }
@@ -302,6 +363,7 @@ export const createDeferredSortedVirtualList = <T, >(args: CreateDeferredSortedV
   <VerticalVirtualList
     ref={list}
     itemHeight={itemSize}
+    layout={layout?.()}
     list={fullItems()}
     forceHostHeight={!wasAtLeastOnceFetched()}
     animate={blockedAnimationCount() === 0}
@@ -344,7 +406,7 @@ export const createDeferredSortedVirtualList = <T, >(args: CreateDeferredSortedV
           when={canShow()}
           fallback={
             <LoadingDialogSkeleton
-              class={styles.Item}
+              class={VIRTUAL_LIST_ITEM_CLASS_NAME}
               style={{top: props.top + 'px'}}
               seed={props.idx}
               size={itemSize}
@@ -356,7 +418,7 @@ export const createDeferredSortedVirtualList = <T, >(args: CreateDeferredSortedV
             id={props.item?.id}
             value={props.item?.value}
             top={props.top}
-            animating={props.animating}
+            glide={props.glide}
           />
         </Show>
       );
@@ -367,7 +429,11 @@ export const createDeferredSortedVirtualList = <T, >(args: CreateDeferredSortedV
   />;
 
   return {
-    dispose,
+    dispose: () => {
+      const discarded = [...pinnedItems(), ...items()];
+      dispose();
+      discard(discarded);
+    },
 
     list,
 

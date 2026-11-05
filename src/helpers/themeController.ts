@@ -1,15 +1,16 @@
 import type {AppTheme, AppThemeSettings} from '@config/state';
 import type {AccentPreset} from '@config/themePresets';
-import type {BaseTheme, Theme, ThemeSettings} from '@layer';
-import {blendWallpaperForTinted, presetThemeId, presetToThemeSettings} from '@config/themePresets';
+import type {BaseTheme, Theme, ThemeSettings, WallPaper} from '@layer';
+import {blendWallpaperForTinted, getCloudThemeWallpaper, presetThemeId, presetToThemeSettings} from '@config/themePresets';
 import type {AppBackgroundTab} from '@components/sidebarLeft/tabs/background';
 import type {AppChatBackground} from '@components/chat/bubbles/chatBackground';
+import {applyOutgoingMessageGradient, getOutgoingMessageGradient, keepReadableOnOutgoingMessageGradient, MESSAGE_OUT_TINT} from '@helpers/outgoingMessageGradient';
 import IS_TOUCH_SUPPORTED from '@environment/touchSupport';
-import {IS_APPLE_MOBILE} from '@environment/userAgent';
 import rootScope from '@lib/rootScope';
-import {changeColorAccent, ColorRgb, getAccentColor, getAverageColor, getRgbColorFromTelegramColor, hexToRgb, hslaStringToHex, hslaStringToRgba, hslaToRgba, hsvToRgb, mixColors, rgbaToHexa, rgbaToHsla, rgbToHsv} from '@helpers/color';
+import {changeColorAccent, ColorRgb, ensureTextContrast, getAccentColor, getAverageColor, getRgbColorFromTelegramColor, hexToRgb, hslaStringToHex, hslaStringToRgba, hslaToRgba, hsvToRgb, mixColors, relativeLuminance, rgbaToHexa, rgbaToHsla, rgbToHsv} from '@helpers/color';
 import {SETTINGS_INIT} from '@config/state';
 import {MOUNT_CLASS_TO} from '@config/debug';
+import Modes from '@config/modes';
 import customProperties from '@helpers/dom/customProperties';
 import {TelegramWebViewTheme} from '@types';
 import windowSize from '@helpers/windowSize';
@@ -52,6 +53,8 @@ const appColorMap: {[name in AppColorName]: AppColor} = {
     darkRgb: true
   },
   'message-out-primary-color': {
+    // * the tint, over a gradient of the bubbles (`--message-out-gradient-light-primary-color`)
+    light: true,
     lightFilled: true,
     rgb: true
   },
@@ -122,7 +125,6 @@ const colorMap: {
     'body-background-color': '#ffffff',
     'border-color': '#dfe1e5',
     'secondary-color': '#c4c9cc',
-    'link-color': '#00488f',
     'input-search-background-color': '#ffffff'
   },
   night: {
@@ -140,7 +142,6 @@ const colorMap: {
     'body-background-color': '#181818',
     'border-color': '#0f0f0f',
     'secondary-color': '#707579',
-    'link-color': '#8774E1', // SCSS resolves to var(--primary-color)
     'input-search-background-color': '#181818'
   },
   tinted: {
@@ -159,12 +160,11 @@ const colorMap: {
     'saved-color': '#3685FA',
     'green-color': '#61D36B',
     // background / body-bg ← windowBackgroundGray, border ← divider (alpha-stripped),
-    // input-search-bg ← chat_messagePanelBackground, link ← windowBackgroundWhiteLinkText
+    // input-search-bg ← chat_messagePanelBackground
     'background-color': '#151E27',
     'body-background-color': '#151E27',
     'border-color': '#0F151B',
     'secondary-color': '#7D8B99',
-    'link-color': '#5EABE1',
     'input-search-background-color': '#212D3B'
   },
   light: {
@@ -184,7 +184,6 @@ const colorMap: {
     'body-background-color': '#FFFFFF',
     'border-color': '#DFE1E5',
     'secondary-color': '#C4C9CC',
-    'link-color': '#238AE3', // windowBackgroundWhiteBlueText
     'input-search-background-color': '#FFFFFF'
   }
 };
@@ -226,6 +225,10 @@ export class ThemeController {
     // here whenever `settings.theme` changes (radio in General Settings, switchTheme calls).
     const themeKey = joinDeepPath('settings', 'theme');
     rootScope.addEventListener('settings_updated', ({key, value}) => {
+      if(key === joinDeepPath('settings', 'increaseContrast')) {
+        this.setTheme();
+        return;
+      }
       if(key !== themeKey) return;
       const [, setAppSettings] = useAppSettings();
       if(value === 'night' || value === 'tinted') {
@@ -318,6 +321,11 @@ export class ThemeController {
     }
   }
 
+  // Increase Contrast is part of the a11y layer: its row, and a value stored earlier, count only with it on
+  private isHighContrast() {
+    return Modes.a11y && !!useAppSettings()[0].increaseContrast;
+  }
+
   public _setTheme(silent?: boolean) {
     const _log = log.bindPrefix('setTheme');
     _log(`set colors, silent=${silent}`);
@@ -326,6 +334,7 @@ export class ThemeController {
     colorScheme?.setAttribute('content', isNight ? 'dark' : 'light');
 
     document.documentElement.classList.toggle('night', isNight);
+    document.documentElement.classList.toggle('high-contrast', this.isHighContrast());
     this.setThemeColor();
     const theme = this.getTheme();
     this.applyTheme(theme);
@@ -349,9 +358,10 @@ export class ThemeController {
 
   public setTheme(coordinates?: {x: number, y: number}) {
     const _log = log.bindPrefix('setTheme');
-    const fast = !('startViewTransition' in document) || !this.applied;
-    const animationsAvailable = liteMode.isAvailable('animations');
-    _log(`start, fast=${fast}, coordinates=${JSON.stringify(coordinates)}, animations=${animationsAvailable}`);
+    // off: the theme changes at once; reduced: it crossfades instead of spreading from the click
+    const animationLevel = liteMode.getAnimationLevel();
+    const fast = !('startViewTransition' in document) || !this.applied || !animationLevel;
+    _log(`start, fast=${fast}, coordinates=${JSON.stringify(coordinates)}, animationLevel=${animationLevel}`);
 
     if(fast) {
       const silent = !this.applied;
@@ -366,7 +376,7 @@ export class ThemeController {
       return;
     }
 
-    if(!animationsAvailable) {
+    if(animationLevel < 2) {
       coordinates = undefined;
     }
 
@@ -407,40 +417,51 @@ export class ThemeController {
     transition.finished.catch(noop).then(() => clearTimeout(safetyTimeout));
 
     if(!coordinates) {
+      // Overlapping switches can skip even the default fade. Its `ready`
+      // promise still rejects although there is no custom reveal to await it.
+      transition.ready.catch(noop);
       _log('view transition is not needed');
       return;
     }
 
     const {x, y} = coordinates;
-    // Get the distance to the furthest corner
-    const endRadius = Math.hypot(
-      Math.max(x, windowSize.width - x),
-      Math.max(y, windowSize.height - y)
-    );
+    const pseudoElement = `::view-transition-${reverse ? 'old' : 'new'}(root)`;
 
     let clipAnimation: Animation;
     transition.ready.then(() => {
       _log('view transition ready');
 
-      // Chromium's view-transition snapshots use backing-store pixels for clip-path geometry.
-      // iOS WebKit keeps the pseudo-element in CSS pixels, so applying DPR there shifts both the
-      // reveal origin and its final radius by 2-3x.
-      const scale = IS_APPLE_MOBILE ? 1 : window.devicePixelRatio || 1;
-      const clipX = x * scale;
-      const clipY = y * scale;
+      // The clip is given in percentages of the snapshot's own box, never in px. Older Chromium
+      // (seen on 152) ran this composited clip-path animation in backing-store pixels, so px
+      // landed at 1/DPR of the click; Chrome 154 resolves px in CSS pixels, as WebKit always did.
+      // A percentage resolves against the box in whatever space it is laid out in, so the origin
+      // and radius follow the click in every engine without sniffing versions or scaling by DPR.
+      const box = getComputedStyle(document.documentElement, pseudoElement);
+      const width = parseFloat(box.width);
+      const height = parseFloat(box.height);
+      const measured = width > 0 && height > 0;
+      // Get the distance to the furthest corner
+      const endRadius = Math.hypot(
+        Math.max(x, (measured ? width : windowSize.width) - x),
+        Math.max(y, (measured ? height : windowSize.height) - y)
+      );
+      // A circle's percentage radius resolves against the box diagonal divided by √2.
+      const circle = measured ?
+        (radius: number) => `circle(${radius / Math.hypot(width, height) * Math.SQRT2 * 100}% at ${x / width * 100}% ${y / height * 100}%)` :
+        (radius: number) => `circle(${radius}px at ${x}px ${y}px)`;
       const {easing, duration, keyframes} = getTransition(
         'standard',
         !reverse,
         [
-          {clipPath: `circle(0 at ${clipX}px ${clipY}px)`},
-          {clipPath: `circle(${endRadius * scale}px at ${clipX}px ${clipY}px)`}
+          {clipPath: circle(0)},
+          {clipPath: circle(endRadius)}
         ]
       );
 
       clipAnimation = document.documentElement.animate(keyframes, {
         duration: duration * 2,
         easing,
-        pseudoElement: `::view-transition-${reverse ? 'old' : 'new'}(root)`,
+        pseudoElement,
         fill: 'forwards' // * without this rule animation will flick at the end
       });
     }).catch(noop); // `ready` rejects when the transition is skipped (safety timeout / overlap / hidden tab)
@@ -556,11 +577,34 @@ export class ThemeController {
     saveToCache?: boolean
   }) {
     const appColor = appColorMap[name];
-    const rgb = hexToRgb(hex);
-    const hsla = rgbaToHsla(...rgb);
-
     const resolvedName: AppTheme['name'] = themeName ?? (isNight ? 'night' : 'day');
     mixColor ??= hexToRgb(colorMap[resolvedName]['surface-color']);
+    const increaseContrast = this.isHighContrast();
+    if(increaseContrast) {
+      if(name === 'message-out-background-color' && isNight) hex = ensureTextContrast(hex, [255, 255, 255]);
+      if(name === 'message-out-primary-color') {
+        const messageSurface = isNight ? hexToRgb(ensureTextContrast(rgbaToHexa(mixColor), [255, 255, 255])) : mixColor;
+        hex = ensureTextContrast(hex, messageSurface);
+      }
+      if(name === 'primary-color' || name === 'secondary-text-color' || name === 'danger-color' || name === 'link-color' || name === 'green-color') {
+        const background = hexToRgb(colorMap[resolvedName]['background-color']);
+        const surfaceLuminance = relativeLuminance(mixColor);
+        const backgroundLuminance = relativeLuminance(background);
+        const limitingSurface = isNight ?
+          (surfaceLuminance > backgroundLuminance ? mixColor : background) :
+          (surfaceLuminance < backgroundLuminance ? mixColor : background);
+        // Text also appears on the lightly lifted cards and hover surfaces.
+        hex = ensureTextContrast(hex, isNight ? mixColors([255, 255, 255], limitingSurface, .05) : limitingSurface);
+      }
+    }
+    if(name === 'primary-color' || name === 'secondary-text-color' || name === 'danger-color') {
+      // Accent text sits on the surface; white button text sits on the accent.
+      // A separate fill keeps both readable, including on dark/custom themes.
+      const buttonColorName = name.replace('-text', '').replace('-color', '-button-color');
+      element.style.setProperty('--' + buttonColorName, increaseContrast ? ensureTextContrast(hex, [255, 255, 255]) : hex);
+    }
+    const rgb = hexToRgb(hex);
+    const hsla = rgbaToHsla(...rgb);
     const lightenedRgb = mixColors(rgb, mixColor, lightenAlpha);
 
     const darkenedHsla: typeof hsla = {
@@ -594,13 +638,9 @@ export class ThemeController {
   public applyAccentPreset(preset: AccentPreset) {
     const currentTheme = this.getTheme();
     const baseTheme = this.getBaseThemeForName(currentTheme.name);
-    const settings = presetToThemeSettings(preset, baseTheme);
     // iOS dayColorPresets have `wallpaper: nil` — those presets only swap accent + bubbles
-    // and keep the current wallpaper. Mirror that here: setBackgroundDocument requires a
-    // WallPaper, so fall back to the current AppTheme's wallpaper when the preset omits one.
-    if(!settings.wallpaper) {
-      settings.wallpaper = this.getThemeSettings(currentTheme)?.wallpaper;
-    }
+    // and keep the current wallpaper, which applyNewTheme does for any theme without one.
+    const settings = presetToThemeSettings(preset, baseTheme);
     const synthetic: Theme = {
       _: 'theme',
       id: presetThemeId(preset),
@@ -646,10 +686,12 @@ export class ThemeController {
     // (accent preset). Server cloud themes carry numeric/hash ids.
     const themeId = String(theme.id ?? '');
     const isCurated = themeId === '' || themeId.startsWith('preset:');
-    let effectiveWallpaper = themeSettings.wallpaper;
+    let effectiveWallpaper = getCloudThemeWallpaper(theme, themeSettings);
     if(themeName === 'tinted' && !isCurated && effectiveWallpaper) {
       effectiveWallpaper = blendWallpaperForTinted(effectiveWallpaper, themeSettings.accent_color);
     }
+    // setBackgroundDocument requires a WallPaper; the current one is already of this base
+    effectiveWallpaper ??= this.getThemeWallpaper(currentTheme);
 
     // Preserve every base entry from the cloud theme (mirrors iOS' `[TelegramThemeSettings]`).
     // Only the entry matching the current base gets the (optionally tinted-blended) wallpaper.
@@ -702,6 +744,18 @@ export class ThemeController {
     const baseTheme = this.getBaseThemeForName(themeName);
     return theme.settings.find((s) => s.base_theme._ === baseTheme) ??
       theme.settings.find((s) => s.base_theme._ === ((isNight ?? this.isNightThemeName(themeName)) ? 'baseThemeNight' : 'baseThemeClassic'));
+  }
+
+  // What the chat is drawn on under a theme. Cloud themes often give a base no wallpaper of its own
+  // (mostly baseThemeDay's): those keep the current one, or the factory one where a theme without
+  // one was saved as the current theme.
+  public getThemeWallpaper(theme: Theme | AppTheme): WallPaper {
+    const settings = this.getThemeSettings(theme);
+    // * an AppTheme keeps what was picked; a theme of a chat comes as the server gave it
+    const own = settings && ((theme as AppTheme).name ? settings.wallpaper : getCloudThemeWallpaper(theme as Theme, settings as ThemeSettings));
+    return own ??
+      this.getThemeSettings(this.getTheme())?.wallpaper ??
+      this.getThemeSettings(SETTINGS_INIT.themes.find((t) => t.name === this.getResolvedThemeName())).wallpaper;
   }
 
   // Persist a wallpaper pick (Chat Wallpaper tab grid click / upload) onto the *current*
@@ -809,6 +863,12 @@ export class ThemeController {
       darkenAlpha: 0.04
     });
 
+    // links are in the accent colour, whichever it is
+    applyAppColor({
+      name: 'link-color',
+      hex: newAccentHex
+    });
+
     applyAppColor({
       name: 'saved-color',
       hex: newAccentHex,
@@ -830,6 +890,11 @@ export class ThemeController {
       applyAppColor({name: 'secondary-color', hex: mainSecondaryColor!});
       applyAppColor({name: 'secondary-text-color', hex: mainSecondaryTextColor!});
     }
+
+    // * increased contrast keeps the bubbles of the one colour it adjusts for the text
+    const outgoingTextColor = hexToRgb(baseColors['primary-text-color']);
+    const outgoingGradient = this.isHighContrast() ? undefined : getOutgoingMessageGradient(themeSettings.message_colors, !!themeSettings.pFlags?.message_colors_animated, outgoingTextColor);
+    applyOutgoingMessageGradient(element, outgoingGradient);
 
     if(!themeSettings.message_colors?.length) {
       return;
@@ -885,10 +950,14 @@ export class ThemeController {
       lightenAlpha: messageLightenAlpha
     });
 
+    const outgoingAccent = rgbaToHexa(accentColor2 ? hsvToRgb(...accentColor2) : myMessagesAccent);
     applyAppColor({
       name: 'message-out-primary-color',
-      hex: isNight ? '#ffffff' : rgbaToHexa(accentColor2 ? hsvToRgb(...accentColor2) : myMessagesAccent),
-      mixColor: newMessageOutBackgroundColor
+      // * the time, the ticks and the links of a bubble of a gradient are read on all of it
+      hex: isNight ? '#ffffff' : outgoingGradient ? keepReadableOnOutgoingMessageGradient(outgoingAccent, outgoingGradient) : outgoingAccent,
+      mixColor: newMessageOutBackgroundColor,
+      // * a reaction's tint, which the colour is read on over a gradient
+      lightenAlpha: MESSAGE_OUT_TINT
     });
 
     // if(accentColor2) {

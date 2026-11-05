@@ -1,9 +1,11 @@
-import {batch, onCleanup} from 'solid-js';
+import {batch, createMemo, createRoot, onCleanup} from 'solid-js';
 import namedPromises from '@helpers/namedPromises';
+import reorderIndexes from '@helpers/array/reorderIndexes';
 import pickKeys from '@helpers/object/pickKeys';
 import safeAssign from '@helpers/object/safeAssign';
-import {default as appDialogsManager, DialogElement} from '@lib/appDialogsManager';
-import {AppManagers} from '@lib/managers';
+import {default as appDialogsManager} from '@lib/appDialogsManager';
+import {DialogElement} from '@components/dialogElement';
+import {ReadingManagers} from '@lib/managers';
 import getDialogIndex from '@appManagers/utils/dialogs/getDialogIndex';
 import getDialogIndexKey from '@appManagers/utils/dialogs/getDialogIndexKey';
 import {logger} from '@lib/logger';
@@ -12,10 +14,13 @@ import {LoadingDialogSkeletonSize} from '@components/loadingDialogSkeleton';
 import Scrollable from '@components/scrollable';
 import {attachCommunityChildBadge} from '@components/communities/communityDialog';
 import rootScope from '@lib/rootScope';
+import useElementSize from '@hooks/useElementSize';
+import {DIALOG_WITH_FOLDER_TAGS_HEIGHT, DialogFolderTagsContext} from '@components/folderTags/dialogFolderTags';
+import {bindManagersToSession} from '@lib/accounts/bindManagersToAccount';
 
 export default class SortedDialogList {
   private appDialogsManager: typeof appDialogsManager;
-  public managers: AppManagers;
+  public managers: ReadingManagers;
   public log: ReturnType<typeof logger>;
   public list: HTMLElement;
   public indexKey: ReturnType<typeof getDialogIndexKey>;
@@ -23,7 +28,20 @@ export default class SortedDialogList {
   public virtualFilterId: PeerId;
   public monoforumParentPeerId: PeerId;
 
+  /**
+   * Whether this is the chat list of a folder (any folder - All, a custom one, the archive), as
+   * opposed to the topics of a forum, the threads of a monoforum or the saved dialogs. Not
+   * `indexKey === 'index_0'`: that is All alone, and a row of any other folder never got the
+   * unread badge on its avatar when the list narrowed under a forum
+   */
+  public get isMainList() {
+    return !this.virtualFilterId && !this.monoforumParentPeerId;
+  }
+
   private virtualList: ReturnType<typeof createDeferredSortedVirtualList<SortedDialogListItem>>;
+  /** what the rows get for their folder tags, in a folder's chat list */
+  private folderTags: DialogFolderTagsContext;
+  private disposeFolderTags: () => void;
   private totalCount = 0;
   private totalCountOffset = 0;
 
@@ -48,7 +66,9 @@ export default class SortedDialogList {
     onListShrinked: () => void,
     itemSize: LoadingDialogSkeletonSize,
     noAvatar?: boolean // For the loading skeleton placeholder,
-    extraPaddingBottom?: number
+    extraPaddingBottom?: number,
+    // the folder whose chat list this is: its rows wear the tags of the other folders
+    folderTagsFilterId?: number
   }) {
     safeAssign(this, pickKeys(options, [
       'appDialogsManager',
@@ -98,15 +118,46 @@ export default class SortedDialogList {
 
         return dialogElement.dom.listEl;
       },
+      // * A dropped DialogElement owns a middlewareHelper (getDialogOptions passes controlled: true),
+      // * and everything wrapped under it - the emoji status renderer, its lottie/video players, the
+      // * subtitle's custom emoji - is released only by that helper's destroy. The list used to drop
+      // * elements without it (removeItem, checkShrink's trimmed tail, clear, dispose), so every
+      // * trimmed row leaked its renderer, and the compositor worker kept its OffscreenCanvas forever.
+      // * Only 'dialog' items are ours to destroy: the custom ones are the caller's own objects,
+      // * handed in as the key, and may be re-added later.
+      onItemDiscard: (item) => {
+        if(item.type === 'dialog') {
+          this.unmountedDialogElements.delete(item.value);
+          item.value.destroy();
+        }
+      },
+      // * a row comes into the list in the state the selection has it in: one built while rows are
+      // * being selected (loaded as the list is scrolled) never had a checkbox, and one remounted
+      // * may still carry the one it had when it went out of view, from a mode that has since ended
+      onItemMount: (item, element) => {
+        if(item.type === 'dialog') {
+          this.appDialogsManager.getSelectionForRow(element)?.applyToElement(element, false);
+        }
+      },
       onItemUnmount: (item) => {
         if(item.type === 'dialog') {
           this.unmountedDialogElements.set(item.value, true);
+          // the nodes survive the unmount but their custom emoji do not, so the
+          // re-init below must rebuild the subtitle rather than recognize it as
+          // already rendered
+          delete item.value.dom.lastMessageRenderKey;
         }
       },
       onListShrinked: options.onListShrinked,
       requestItemForIdx: options.requestItemForIdx,
       sortWith: (a, b) => b - a,
       itemSize: options.itemSize,
+      // * a row with folder tags is a line taller
+      getItemHeight: options.folderTagsFilterId !== undefined ? (item) => {
+        return item.type === 'dialog' && item.value.folderTags?.hasTags() ?
+          DIALOG_WITH_FOLDER_TAGS_HEIGHT :
+          options.itemSize;
+      } : undefined,
       noAvatar: options.noAvatar,
       onListLengthChange: options.onListLengthChange,
       extraPaddingBottom: options.extraPaddingBottom
@@ -115,14 +166,37 @@ export default class SortedDialogList {
     this.list = this.virtualList.list;
 
     this.list.classList.add('chatlist', 'virtual-chatlist');
+
+    if(options.folderTagsFilterId !== undefined) {
+      createRoot((dispose) => {
+        this.disposeFolderTags = dispose;
+        // * every row is as wide as the list's content, so the one observer serves them all
+        const listSize = useElementSize(() => this.list);
+        const rowWidth = createMemo(() => {
+          const width = listSize.width;
+          if(!width) {
+            return 0;
+          }
+
+          const style = getComputedStyle(this.list);
+          return width - parseFloat(style.paddingLeft) - parseFloat(style.paddingRight);
+        });
+
+        this.folderTags = {
+          filterId: options.folderTagsFilterId,
+          width: rowWidth
+        };
+      });
+    }
   }
 
 
   public async getIndexForKey(key: any) {
+    const managers = bindManagersToSession(this.managers);
     if(key instanceof CustomPinnedDialog) return 0;
     if(key instanceof CustomSortedDialog) {
       return key.getIndex({
-        managers: this.managers,
+        managers,
         indexKey: this.indexKey
       });
     }
@@ -130,11 +204,11 @@ export default class SortedDialogList {
     if(key === this.virtualFilterId && key !== rootScope.myId) return 0;
 
     if(this.monoforumParentPeerId) {
-      const dialog = await this.managers.monoforumDialogsStorage.getDialogByParent(this.monoforumParentPeerId, key);
+      const dialog = await managers.monoforumDialogsStorage.getDialogByParent(this.monoforumParentPeerId, key);
       return getDialogIndex(dialog);
     }
 
-    return this.managers.dialogsStorage.getDialogIndex(
+    return managers.dialogsStorage.getDialogIndex(
       this.virtualFilterId ?? key,
       this.indexKey,
       this.virtualFilterId ? key : undefined
@@ -158,12 +232,13 @@ export default class SortedDialogList {
       loadPromises,
       isBatch: true,
       threadId: (this.virtualFilterId && key !== this.virtualFilterId) || rootScope.myId === this.virtualFilterId ? key : undefined,
-      isMainList: this.indexKey === 'index_0',
+      isMainList: this.isMainList,
       controlled: true,
       monoforumParentPeerId: key !== this.monoforumParentPeerId ? this.monoforumParentPeerId : undefined,
       asAllChats: this.getAsAllChats(key),
       meAsSaved: !this.monoforumParentPeerId,
-      wrapOptions: undefined
+      wrapOptions: undefined,
+      folderTags: this.folderTags
     };
 
     return {options, loadPromises};
@@ -195,10 +270,7 @@ export default class SortedDialogList {
     options.autoDeletePeriod = autoDeletePeriod;
 
     const dialogElement = this.appDialogsManager.addListDialog(options);
-    if(
-      !this.virtualFilterId &&
-      !this.monoforumParentPeerId
-    ) {
+    if(this.isMainList) {
       attachCommunityChildBadge(dialogElement, key);
     }
 
@@ -214,8 +286,7 @@ export default class SortedDialogList {
     if(
       key instanceof CustomPinnedDialog ||
       key instanceof CustomSortedDialog ||
-      this.virtualFilterId ||
-      this.monoforumParentPeerId
+      !this.isMainList
     ) return;
 
     const dialog = await this.managers.dialogsStorage.getDialogOnly(key);
@@ -263,7 +334,16 @@ export default class SortedDialogList {
 
   public delete(key: any, adjustTotalCount = true) {
     batch(() => {
-      if(this.virtualList.removeItem(key) && adjustTotalCount) {
+      // * Pinned entries live in their own collection, but every read API merges both - has(),
+      // * getDialogElement() and getAllDialogElementsMap() all see them - so callers routinely
+      // * discover a pinned key and delete it through here (validateListForFilter walks the merged
+      // * map; updateDialog gates on has()). Removing only from the unpinned side left the row on
+      // * screen, took the total count down for a row that never went away, and never reached
+      // * onItemDiscard, so the DialogElement kept its middlewareHelper - and everything under it -
+      // * until the tab was closed. Both sides, so delete means delete.
+      const removedPinned = this.virtualList.removePinnedItem(key);
+      const removedItem = this.virtualList.removeItem(key);
+      if((removedPinned || removedItem) && adjustTotalCount) {
         this.adjustTotalCount(-1);
       }
     });
@@ -309,6 +389,30 @@ export default class SortedDialogList {
     return this.virtualList.sortedItems();
   }
 
+  /**
+   * Reorders rows the list already holds by handing them each other's indexes, without asking the
+   * managers for fresh ones - so a reorder the user just performed by hand is on screen in the same
+   * task, before any round trip. The managers regenerate the very same order right after (see
+   * `appMessagesManager.reorderPinnedDialogs`), so this is the optimistic half of one reorder, not
+   * a second source of truth.
+   *
+   * @param keys the keys to reorder, in the order they have to end up in
+   * @returns whether every key was in the list, i.e. whether the new order was applied
+   */
+  public reorderItems(keys: any[]) {
+    // the list puts the greatest index first, so the indexes come back top to bottom
+    const indexes = reorderIndexes(this.getSortedItems(), keys, true);
+    if(!indexes) {
+      return false;
+    }
+
+    batch(() => {
+      keys.forEach((key, idx) => this.virtualList.updateItem(key, indexes[idx]));
+    });
+
+    return true;
+  }
+
   public async update(key: any, canFinish: () => boolean = () => true) {
     const index = await this.getIndexForKey(key);
     if(!canFinish()) {
@@ -330,6 +434,7 @@ export default class SortedDialogList {
 
   public destroy() {
     this.virtualList?.dispose();
+    this.disposeFolderTags?.();
   }
 }
 
@@ -349,7 +454,7 @@ interface CustomSortedDialogCtorArgs {
   render: () => HTMLElement;
   destroy?: () => void;
   getIndex: (context: {
-    managers: AppManagers,
+    managers: ReadingManagers,
     indexKey: ReturnType<typeof getDialogIndexKey>
   }) => MaybePromise<number>;
 };

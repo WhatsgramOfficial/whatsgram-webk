@@ -6,13 +6,13 @@ import {IconTsx} from '@components/iconTsx';
 import {InputFieldTsx} from '@components/inputFieldTsx';
 import MediaHeader from '@components/mediaHeader';
 import PeerTitle from '@components/peerTitle';
-import {PreloaderTsx} from '@components/putPreloader';
+import RadioFieldTsx from '@components/radioFieldTsx';
 import Row from '@components/rowTsx';
 import SaveButton from '@components/saveButton';
+import {SearchEmpty, SearchLoading} from '@components/searchStatus';
 import Section from '@components/section';
-import {AppAddMembersTab, AppChatAutomationTab, type AppAddMembersExtraCategory} from '@components/solidJsTabs/tabs';
+import {type AppAddMembersExtraCategory} from '@components/solidJsTabs/tabs';
 import {useSuperTab} from '@components/solidJsTabs/superTabProvider';
-import StaticRadio from '@components/staticRadio';
 import {toastNew} from '@components/toast';
 import {FontFamily, FontWeightBold} from '@config/font';
 import cancelEvent from '@helpers/dom/cancelEvent';
@@ -22,8 +22,6 @@ import deepEqual from '@helpers/object/deepEqual';
 import isSameUserId from '@helpers/isSameUserId';
 import useIsConfirmationNeededOnClose from '@hooks/useIsConfirmationNeededOnClose';
 import {BusinessBotRecipients, BusinessBotRights, ConnectedBot} from '@layer';
-import appDialogsManager from '@lib/appDialogsManager';
-import appImManager from '@lib/appImManager';
 import I18n, {i18n, join, LangPackKey} from '@lib/langPack';
 import {createEffect, createMemo, createSignal, For, on, onCleanup, Show} from 'solid-js';
 import {createStore} from 'solid-js/store';
@@ -42,6 +40,8 @@ import {
   makeChatAutomationRecipientsDraft,
   toBusinessBotRecipients
 } from '@components/sidebarLeft/tabs/chatAutomationRecipients';
+import type {AppChatAutomationTab} from '@components/solidJsTabs/tabs';
+import {hotReloadGuard} from '@lib/solidjs/hotReloadGuardProvider';
 
 type AppChatAutomationTabType = typeof AppChatAutomationTab;
 type RightKey = keyof BusinessBotRights.businessBotRights['pFlags'];
@@ -173,7 +173,7 @@ function BotDialog(props: {userId: UserId, onAdd?: () => void}) {
   const [tab] = useSuperTab<AppChatAutomationTabType>();
   const onAdd = props.onAdd;
   const peerId = props.userId.toPeerId(false);
-  const dialogElement = appDialogsManager.addDialogNew({
+  const dialogElement = hotReloadGuard.appDialogsManager.addDialogNew({
     peerId,
     rippleEnabled: true,
     avatarSize: 'abitbigger',
@@ -185,7 +185,7 @@ function BotDialog(props: {userId: UserId, onAdd?: () => void}) {
     }
   });
   const removeDialogClickListener = attachClickEvent(dialogElement.container, () => {
-    appImManager.setInnerPeer({peerId});
+    hotReloadGuard.appImManager.setInnerPeer({peerId});
   });
   let active = true;
   const removeAddClickListener = onAdd && (() => {
@@ -231,7 +231,7 @@ function BotDialog(props: {userId: UserId, onAdd?: () => void}) {
 }
 
 function BotDialogList(props: {userIds: UserId[], onAdd?: (userId: UserId) => void}) {
-  const list = appDialogsManager.createChatList({ignoreClick: true});
+  const list = hotReloadGuard.appDialogsManager.createChatList({ignoreClick: true});
 
   return (
     <div class="chatlist-container">
@@ -242,28 +242,6 @@ function BotDialogList(props: {userIds: UserId[], onAdd?: (userId: UserId) => vo
         </For>
       </Portal>
     </div>
-  );
-}
-
-function AccessRadio(props: {checked: boolean, onChange: () => void}) {
-  const [focusVisible, setFocusVisible] = createSignal(false);
-
-  return (
-    <>
-      <input
-        type="radio"
-        name="chat-automation-access"
-        checked={props.checked}
-        onChange={props.onChange}
-        onFocus={(event) => setFocusVisible(event.currentTarget.matches(':focus-visible'))}
-        onBlur={() => setFocusVisible(false)}
-      />
-      <StaticRadio
-        classList={{[styles.accessRadioFocused]: focusVisible()}}
-        floating
-        checked={props.checked}
-      />
-    </>
   );
 }
 
@@ -413,8 +391,7 @@ function BotPermissions(props: {
       if(!info.fixed) return;
 
       info.checkboxField.input.disabled = true;
-      row.container.classList.add('is-disabled');
-      row.container.setAttribute('aria-disabled', 'true');
+      row.toggleDisability(true);
     },
     onAnyChange: () => {
       if(changeScheduled) return;
@@ -557,7 +534,7 @@ export default function ChatAutomationTab() {
       categoryKeys.forEach((key) => store.categories[key] && selectedExtras.add(key));
     }
 
-    tab.slider.createTab(AppAddMembersTab).open({
+    tab.slider.createTab(hotReloadGuard.tabs.AppAddMembersTab).open({
       title: excludeUsersOnly ? 'ChatAutomation.ExcludedChats' :
         (store.excludeSelected ? 'ChatAutomation.ExcludeChats' : 'ChatAutomation.SelectChats'),
       placeholder: 'SearchPlaceholder',
@@ -827,22 +804,15 @@ export default function ChatAutomationTab() {
             />
           </div>
           <Show when={searching()}>
-            <div
-              class={styles.searchLoading}
-              role="status"
-              aria-live="polite"
-              aria-label={I18n.format('ChatAutomation.Searching', true)}
-            >
-              <PreloaderTsx class={styles.searchPreloader} />
-            </div>
+            <SearchLoading aria-label={I18n.format('ChatAutomation.Searching', true)} />
           </Show>
           <BotDialogList userIds={searchResults()} onAdd={selectBot} />
           <Show when={!searching() && searchFinished() && !searchResults().length}>
-            <div class={styles.searchEmpty} role="status" aria-live="polite">
+            <SearchEmpty>
               {i18n(searchFailed() ?
                 'ChatAutomation.SearchFailed' :
                 (unsupportedUserId() ? 'ChatAutomation.BotUnsupported' : 'ChatAutomation.BotNotFound'))}
-            </div>
+            </SearchEmpty>
           </Show>
         </Show>
       </Section>
@@ -855,22 +825,28 @@ export default function ChatAutomationTab() {
           'aria-label': I18n.format('ChatAutomation.AccessibleChats', true)
         }}
       >
-        <Row clickable={() => setRecipientMode(true)}>
-          <Row.CheckboxField>
-            <AccessRadio
+        <Row>
+          <Row.RadioField>
+            <RadioFieldTsx
+              class="disable-hover"
               checked={store.excludeSelected}
-              onChange={() => setRecipientMode(true)}
+              name="chat-automation-access"
+              value="all-except"
+              onChange={(checked) => checked && setRecipientMode(true)}
             />
-          </Row.CheckboxField>
+          </Row.RadioField>
           <Row.Title>{i18n('ChatAutomation.AllExcept')}</Row.Title>
         </Row>
-        <Row clickable={() => setRecipientMode(false)}>
-          <Row.CheckboxField>
-            <AccessRadio
+        <Row>
+          <Row.RadioField>
+            <RadioFieldTsx
+              class="disable-hover"
               checked={!store.excludeSelected}
-              onChange={() => setRecipientMode(false)}
+              name="chat-automation-access"
+              value="only-selected"
+              onChange={(checked) => checked && setRecipientMode(false)}
             />
-          </Row.CheckboxField>
+          </Row.RadioField>
           <Row.Title>{i18n('ChatAutomation.OnlySelected')}</Row.Title>
         </Row>
       </Section>

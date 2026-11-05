@@ -2,16 +2,21 @@ import replaceContent from '@helpers/dom/replaceContent';
 import OverlayClickHandler from '@helpers/overlayClickHandler';
 import {getOverlayRoot} from '@helpers/appWindow';
 import {FormatterArguments, i18n, LangPackKey} from '@lib/langPack';
+import {hotListen} from '@helpers/hotModule';
 
 const toastsContainer = document.createElement('div');
 toastsContainer.classList.add('toasts-container');
+// Live region so screen readers announce toast text as it appears.
+toastsContainer.setAttribute('role', 'status');
+toastsContainer.setAttribute('aria-live', 'polite');
 
 const toastEl = document.createElement('div');
 toastEl.classList.add('toast');
 let timeout: number;
 
-const x = new OverlayClickHandler('toast');
-x.addEventListener('toggle', (open) => {
+// a click anywhere hides the toast; a keyboard press still reaches its control
+const x = new OverlayClickHandler('toast', false, true);
+hotListen(import.meta.hot, x, 'toggle', (open: boolean) => {
   if(!open) {
     hideToast();
   }

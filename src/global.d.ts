@@ -44,6 +44,7 @@ declare global {
   }
 
   interface Window {
+    fillChatInputEditorTestData?: () => boolean | Promise<boolean>;
     Prism?: {
       manual?: boolean
     };
@@ -138,23 +139,28 @@ declare global {
     'translations' | 'animated_emoji' | 'more_upload' | 'emoji_status' | 'profile_badge' |
     'advanced_chat_management' | 'no_ads' | 'app_icons' | 'infinite_reactions' |
     'animated_userpics' | 'premium_stickers' | 'peer_colors' | 'wallpapers' |
-    'saved_tags' | 'last_seen' | 'message_privacy' | 'pm_noforwards';
+    'saved_tags' | 'last_seen' | 'message_privacy' | 'pm_noforwards' |
+    // Telegram Business — the `business_promo_order` set
+    'business_location' | 'business_hours' | 'quick_replies' | 'greeting_message' |
+    'away_message' | 'business_bots' | 'business_links' | 'business_intro' | 'folder_tags';
 
   type MTMimeType = 'video/quicktime' | 'image/gif' | 'image/jpeg' | 'application/pdf' |
-    'video/mp4' | 'image/webp' | 'audio/mpeg' | 'audio/ogg' | 'application/octet-stream' |
+    'video/mp4' | 'image/webp' | 'audio/aac' | 'audio/flac' | 'audio/mp4' | 'audio/mpeg' |
+    'audio/ogg' | 'video/ogg' | 'application/octet-stream' |
     'application/x-tgsticker' | 'video/webm' | 'image/svg+xml' | 'image/png' | 'application/json' |
     'application/x-tgwallpattern' | 'audio/wav' | 'image/avif' | 'image/jxl' | 'image/bmp' |
-    'application/x-mpegurl' | 'application/x-tgstoryboard' | 'application/x-tgstoryboardmap';
+    'image/heic' | 'application/x-mpegurl' | 'application/x-tgstoryboard' | 'application/x-tgstoryboardmap';
 
   type MTFileExtension = 'mov' | 'gif' | 'pdf' | 'jpg' | 'jpeg' | 'wav' |
-    'tgv' | 'tgs' | 'svg' | 'mp4' | 'webm' | 'webp' | 'mp3' | 'ogg' | 'json' |
-    'png' | 'avif' | 'jxl' | 'bmp';
+    'tgv' | 'tgs' | 'svg' | 'mp4' | 'webm' | 'webp' | 'mp3' | 'm4a' | 'aac' |
+    'flac' | 'opus' | 'oga' | 'ogg' | 'ogv' | 'json' |
+    'png' | 'avif' | 'jxl' | 'bmp' | 'heic' | 'heif';
 
-  type ApiFileManagerError = 'DOWNLOAD_CANCELED' | 'UPLOAD_CANCELED' | 'FILE_TOO_BIG' | 'REFERENCE_IS_NOT_REFRESHED';
+  type ApiFileManagerError = 'DOWNLOAD_CANCELED' | 'UPLOAD_CANCELED' | 'FILE_TOO_BIG' | 'FILE_EMPTY' | 'REFERENCE_IS_NOT_REFRESHED';
   type StorageError = 'STORAGE_OFFLINE' | 'NO_ENTRY_FOUND' | 'IDB_CREATE_TIMEOUT';
   type ReferenceError = 'NO_NEW_CONTEXT' | 'NO_CONTEXT';
-  type NetworkerError = 'NETWORK_BAD_RESPONSE' | 'NETWORK_BAD_REQUEST';
-  type FiltersError = 'PINNED_DIALOGS_TOO_MUCH';
+  type NetworkerError = 'NETWORK_BAD_RESPONSE' | 'NETWORK_BAD_REQUEST' | 'BIND_FAILED';
+  type FiltersError = 'PINNED_DIALOGS_TOO_MUCH' | 'PINNED_DIALOGS_CHANGED';
   type LottieError = 'FRAME_OUT_OF_RANGE' | 'ITEM_DESTROYED' | 'FILE_INVALID';
 
   type LocalFileError = ApiFileManagerError | ReferenceError | StorageError;
@@ -171,13 +177,22 @@ declare global {
     | 'ERROR_EMPTY'
     | 'MTPROTO_CLUSTER_INVALID'
     | 'BOT_PRECHECKOUT_TIMEOUT'
+    | 'BOT_PRECHECKOUT_FAILED'
+    | 'PAYMENT_FAILED'
+    | 'REQUESTED_INFO_INVALID'
+    | 'SHIPPING_OPTION_INVALID'
+    | 'SHIPPING_NOT_AVAILABLE'
+    | 'PAYMENT_CREDENTIALS_INVALID'
+    | 'PAYMENT_CREDENTIALS_ID_INVALID'
     | 'TMP_PASSWORD_INVALID'
     | 'PASSWORD_HASH_INVALID'
+    | 'SRP_ID_INVALID'
     | 'CHANNEL_PRIVATE'
     | 'VOICE_MESSAGES_FORBIDDEN'
     | 'PHOTO_INVALID_DIMENSIONS'
     | 'PHOTO_SAVE_FILE_INVALID'
     | 'USER_ALREADY_PARTICIPANT'
+    | 'USER_WAS_KICKED'
     | 'USERNAME_INVALID'
     | 'USERNAME_PURCHASE_AVAILABLE'
     | 'USERNAMES_ACTIVE_TOO_MUCH'
@@ -207,11 +222,13 @@ declare global {
     | 'DIALOG_FILTERS_TOO_MUCH'
     | 'CHATLISTS_TOO_MUCH'
     | 'FRESH_RESET_AUTHORISATION_FORBIDDEN'
+    | 'FRESH_CHANGE_AUTHORIZATION_FORBIDDEN'
     | 'NO_USER'
     | 'USER_PRIVACY_RESTRICTED'
     | 'REACTION_INVALID'
     | 'INVITE_HASH_EXPIRED'
     | 'PHONE_NOT_OCCUPIED'
+    | 'PHONE_NUMBER_INVALID'
     | 'PARTICIPANT_ID_INVALID'
     | 'PREMIUM_ACCOUNT_REQUIRED'
     | 'BOOST_NOT_MODIFIED'
@@ -245,6 +262,7 @@ declare global {
     | 'FORM_EXPIRED'
     | `FLOOD_PREMIUM_WAIT_${number}`
     | 'STORY_ID_TOO_MANY'
+    | 'STORY_NOT_MODIFIED'
     | `FILE_REFERENCE_${number}_EXPIRED`
     | 'ADDRESS_STREET_LINE1_INVALID'
     | 'ADDRESS_STREET_LINE2_INVALID'
@@ -257,6 +275,10 @@ declare global {
     | 'REQ_INFO_PHONE_INVALID'
     | 'FILE_REFERENCE_INVALID'
     | 'USER_NOT_MUTUAL_CONTACT'
+    | 'USER_BOT'
+    | 'BOTS_TOO_MUCH'
+    | 'YOU_BLOCKED_USER'
+    | 'USER_KICKED'
     | 'FROZEN_METHOD_INVALID'
     | 'EMAIL_INVALID'
     | 'EMAIL_NOT_ALLOWED'
@@ -282,9 +304,29 @@ declare global {
     | 'USERNAME_OCCUPIED'
     | 'MESSAGE_EDIT_FORBIDDEN'
     | 'MESSAGE_ID_INVALID'
+    | 'PHONE_CODE_EMPTY'
+    | 'PHONE_CODE_EXPIRED'
+    | 'PHONE_CODE_INVALID'
   ;
 
-  type ErrorType = LocalErrorType | ServerErrorType;
+  type WalletErrorType =
+    | 'WALLET_UNAVAILABLE'
+    | 'WALLET_USER_UNAVAILABLE'
+    | 'WALLET_TONCENTER_ERROR'
+    | 'WALLET_TRANSFER_RECEIPT_MISSING'
+    | 'WALLET_TRANSFER_SEND_FAILED'
+    | 'WALLET_TRANSFER_DATA_INVALID'
+    | 'WALLET_TRANSFER_FAILED'
+    | 'WALLET_TRANSFER_CANCELLED'
+    | 'WALLET_TRANSFER_EXPIRED'
+    | 'WALLET_TRANSFER_REPLACED'
+    | 'WALLET_KEY_MISMATCH'
+    | 'WALLET_BACKUP_NOT_AVAILABLE'
+    | 'WALLET_PROOF_INVALID'
+    | 'WALLET_ROTATION_NOT_FOUND'
+    | 'PASSWORD_MISSING';
+
+  type ErrorType = LocalErrorType | ServerErrorType | WalletErrorType;
 
   type TelegramChoosePeerType = 'users' | 'bots' | 'groups' | 'channels';
 

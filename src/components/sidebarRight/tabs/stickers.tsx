@@ -10,19 +10,30 @@ import {attachClickEvent} from '@helpers/dom/clickEvent';
 import forEachReverse from '@helpers/array/forEachReverse';
 import setInnerHTML from '@helpers/dom/setInnerHTML';
 import wrapEmojiText from '@lib/richTextProcessor/wrapEmojiText';
-import attachStickerViewerListeners from '@components/stickerViewer';
+import attachMediaPeekListeners from '@components/mediaPeek';
 import wrapSticker from '@components/wrappers/sticker';
 import {getStickerSetInputById, getStickerSetInputByStickerSet} from '@lib/appManagers/utils/stickers/getStickerSetInput';
+import isStickerSetAdded from '@lib/appManagers/utils/stickers/isStickerSetAdded';
 import {useSuperTab} from '@components/solidJsTabs/superTabProvider';
 import {useHotReloadGuard} from '@lib/solidjs/hotReloadGuard';
+import toastError from '@components/toastError';
+import makeError from '@helpers/makeError';
+
+// * a trending set counts as seen once (all but a sliver of) it is on the screen
+const READ_VISIBLE_RATIO = 0.95;
 
 const Stickers: Component = () => {
   const [tab] = useSuperTab();
   const {appImManager, appSidebarRight} = useHotReloadGuard();
 
+  // * an answer that comes after the tab closed renders nothing
+  const middleware = tab.middlewareHelper.get();
   let inputSearch: InputSearch;
   let setsDiv: HTMLDivElement;
   const lazyLoadQueue = new LazyLoadQueue();
+  // * the old trending sets loaded below the current ones: undefined once there are no more
+  let oldFeaturedOffset = 0, loadingOldFeatured = false;
+  let readObserver: IntersectionObserver;
 
   const renderSet = (set: StickerSet.stickerSet) => {
     const div = document.createElement('div');
@@ -44,9 +55,10 @@ const Stickers: Component = () => {
 
     const button = document.createElement('button');
     button.classList.add('btn-primary', 'btn-color-primary', 'sticker-set-button');
-    button.append(i18n(set.installed_date ? 'Stickers.SearchAdded' : 'Stickers.SearchAdd'));
+    const added = isStickerSetAdded(set);
+    button.append(i18n(added ? 'Stickers.SearchAdded' : 'Stickers.SearchAdd'));
 
-    if(set.installed_date) {
+    if(added) {
       button.classList.add('gray');
     }
 
@@ -64,6 +76,10 @@ const Stickers: Component = () => {
     }
 
     tab.managers.appStickersManager.getStickerSet(getStickerSetInputById(set)).then((set) => {
+      if(!middleware()) {
+        return;
+      }
+
       for(let i = 0; i < count; ++i) {
         const div = stickersDiv.children[i] as HTMLDivElement;
         const doc = set.documents[i];
@@ -92,6 +108,48 @@ const Stickers: Component = () => {
     div.append(header, stickersDiv);
 
     setsDiv.append(div);
+    return div;
+  };
+
+  const getRenderedSet = (id: StickerSet.stickerSet['id']) => {
+    return setsDiv.querySelector<HTMLElement>(`.sticker-set[data-sticker-set="${id}"]`);
+  };
+
+  /**
+   * Trending sets are shown — those not in the list yet rendered — as the user is to see them: each,
+   * new or kept from before (a search's), is marked read once it is on the screen whole (as tdesktop's
+   * readVisibleFeatured does); one read already the manager lets alone
+   */
+  const renderFeaturedSets = (coveredSets: StickerSetCovered[]) => {
+    coveredSets.forEach((covered) => {
+      const set = covered.set as StickerSet.stickerSet;
+      readObserver.observe(getRenderedSet(set.id) || renderSet(set));
+    });
+  };
+
+  // * the older trending sets, a page at a time as the list is scrolled to its end (tdesktop, Android)
+  const loadOldFeatured = () => {
+    const offset = oldFeaturedOffset;
+    if(inputSearch.value || loadingOldFeatured || offset === undefined) {
+      return;
+    }
+
+    loadingOldFeatured = true;
+    tab.managers.appStickersManager.getOldFeaturedStickers(offset).then(({sets, nextOffset}) => {
+      loadingOldFeatured = false;
+      // * the list may have been searched in, or gone back to the start, or closed meanwhile
+      if(!middleware() || inputSearch.value || oldFeaturedOffset !== offset) {
+        return;
+      }
+
+      oldFeaturedOffset = nextOffset;
+      renderFeaturedSets(sets);
+      // * the end still in reach — a page that added little or nothing new — asks for the next one;
+      // a page that did not come waits for the next scroll to the end
+      tab.scrollable.checkForTriggers();
+    }, () => {
+      loadingOldFeatured = false;
+    });
   };
 
   const filterRendered = (query: string, coveredSets: StickerSetCovered[]) => {
@@ -105,6 +163,8 @@ const Stickers: Component = () => {
       if(index !== -1) {
         coveredSets.splice(index, 1);
       } else if(!query || !el.dataset.title.toLowerCase().includes(query.toLowerCase())) {
+        // * a trending row not seen yet is watched no longer: it is gone
+        readObserver.unobserve(el);
         el.remove();
       }
     });
@@ -116,14 +176,16 @@ const Stickers: Component = () => {
 
   const renderFeatured = () => {
     return tab.managers.appStickersManager.getFeaturedStickers().then((coveredSets) => {
-      if(inputSearch.value) {
+      if(!middleware() || inputSearch.value) {
         return;
       }
 
-      coveredSets = filterRendered('', coveredSets);
-      coveredSets.forEach((set) => {
-        renderSet(set.set);
-      });
+      // * whatever older sets were below are gone with the filter: they load again from the start
+      oldFeaturedOffset = 0;
+      filterRendered('', coveredSets);
+      // * the rows kept are watched again too: a search may have rendered them anew, unwatched
+      renderFeaturedSets(coveredSets);
+      tab.scrollable.checkForTriggers();
     });
   };
 
@@ -133,7 +195,7 @@ const Stickers: Component = () => {
     }
 
     return tab.managers.appStickersManager.searchStickerSets(query, false).then((coveredSets) => {
-      if(inputSearch.value !== query) {
+      if(!middleware() || inputSearch.value !== query) {
         return;
       }
 
@@ -161,11 +223,28 @@ const Stickers: Component = () => {
     setsDiv.classList.add('sticker-sets');
     tab.scrollable.append(setsDiv);
 
-    attachStickerViewerListeners({listenTo: setsDiv, listenerSetter: tab.listenerSetter});
+    readObserver = new IntersectionObserver((entries) => {
+      const ids = entries
+      .filter((entry) => entry.intersectionRatio >= READ_VISIBLE_RATIO)
+      .map((entry) => {
+        readObserver.unobserve(entry.target);
+        return (entry.target as HTMLElement).dataset.stickerSet;
+      });
+
+      if(ids.length) {
+        tab.managers.appStickersManager.readFeaturedStickerSets(ids);
+      }
+    }, {root: tab.scrollable.container, threshold: READ_VISIBLE_RATIO});
+
+    tab.scrollable.onScrolledBottom = loadOldFeatured;
+
+    attachMediaPeekListeners({listenTo: setsDiv, listenerSetter: tab.listenerSetter});
 
     attachClickEvent(setsDiv, (e) => {
       const sticker = findUpClassName(e.target, 'sticker-set-sticker');
-      if(sticker) {
+      // With no chat to send to — the tab opened from the empty column's Stickers tip — a sticker
+      // falls through to its own set below, which opens the pack.
+      if(sticker && appImManager.chat.peerId) {
         const docId = sticker.dataset.docId;
         appImManager.chat.input.sendMessageWithDocument({document: docId, target: sticker});
         return;
@@ -185,16 +264,24 @@ const Stickers: Component = () => {
 
         button.setAttribute('disabled', 'true');
 
+        // * a set the server would not give (it resolves to nothing) or a toggle it refused leaves the button usable
         tab.managers.appStickersManager.getStickerSet(input).then((full) => {
-          tab.managers.appStickersManager.toggleStickerSet(full.set).then((changed) => {
+          if(!full) {
+            throw makeError('UNKNOWN');
+          }
+
+          return tab.managers.appStickersManager.toggleStickerSet(full.set).then((changed) => {
             if(changed) {
               button.textContent = '';
-              button.append(i18n(full.set.installed_date ? 'Stickers.SearchAdded' : 'Stickers.SearchAdd'));
-              button.classList.toggle('gray', !!full.set.installed_date);
+              const added = isStickerSetAdded(full.set);
+              button.append(i18n(added ? 'Stickers.SearchAdded' : 'Stickers.SearchAdd'));
+              button.classList.toggle('gray', added);
             }
-          }).finally(() => {
-            button.removeAttribute('disabled');
           });
+        }).catch((err: ApiError) => {
+          toastError(err, 'toggle sticker set error');
+        }).finally(() => {
+          button.removeAttribute('disabled');
         });
       } else {
         tab.managers.appStickersManager.getStickerSet(input).then((full) => {
@@ -203,12 +290,21 @@ const Stickers: Component = () => {
       }
     }, {listenerSetter: tab.listenerSetter});
 
-    appSidebarRight.toggleSidebar(true).then(() => {
+    // The tab is opened from the emoticons panel into the right sidebar, and from the empty
+    // column's Stickers tip into the left one — where there is no sidebar to reveal, and where
+    // revealing the right one would just show an empty column.
+    const revealed = tab.slider === appSidebarRight ?
+      appSidebarRight.toggleSidebar(true) :
+      Promise.resolve();
+
+    revealed.then(() => {
       renderFeatured();
     });
   });
 
   onCleanup(() => {
+    readObserver?.disconnect();
+    lazyLoadQueue.clear();
     setsDiv.replaceChildren();
     animationIntersector.checkAnimations(undefined, 'STICKERS-SEARCH');
   });

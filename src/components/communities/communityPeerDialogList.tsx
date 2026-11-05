@@ -1,15 +1,16 @@
+/* @refresh skip */
+// Owns imperative DialogElements and nested Solid roots, so updates remount its owner.
+
 import type {Chat} from '@layer';
-import CommunityAvatar from '@components/communities/communityAvatar';
+import createCommunityAvatarElement
+from '@components/communities/communityAvatarElement';
 import {
   getCommunityPeerSubtitle
 } from '@components/communities/communityPeerStatus';
 import {AvatarNewTsx} from '@components/avatarNew';
 import createContextMenu from '@helpers/dom/createContextMenu';
 import type {Middleware} from '@helpers/middleware';
-import appDialogsManager, {
-  DialogElement,
-  DialogElementSize
-} from '@lib/appDialogsManager';
+import {DialogElement, DialogElementSize} from '@components/dialogElement';
 import createCommunityDialogElement
 from '@components/autonomousDialogList/createCommunityDialogElement';
 import {i18n} from '@lib/langPack';
@@ -26,6 +27,7 @@ import {
 import {insert, render} from 'solid-js/web';
 import styles from '@components/communities/communityPeerDialogList.module.scss';
 import sharedStyles from '@components/communities/communityShared.module.scss';
+import {hotReloadGuard} from '@lib/solidjs/hotReloadGuardProvider';
 
 export type CommunityPeerDialogContextMenu = Omit<
   Parameters<typeof createContextMenu>[0],
@@ -78,7 +80,7 @@ function getClassTokens(value?: string) {
 export default function CommunityPeerDialogList<T>(
   props: CommunityPeerDialogListProps<T>
 ) {
-  const list = appDialogsManager.createChatList();
+  const list = hotReloadGuard.appDialogsManager.createChatList();
   const records = new Map<PeerId, DialogRecord<T>>();
   const rightActionRows = new Map<HTMLElement, HTMLElement>();
   let rightResizeObserver: ResizeObserver;
@@ -153,7 +155,7 @@ export default function CommunityPeerDialogList<T>(
   };
   list.addEventListener('click', onListClick, {capture: true});
 
-  appDialogsManager.setListClickListener({
+  hotReloadGuard.appDialogsManager.setListClickListener({
     list,
     onFound: () => false,
     withContext: props.withDialogContextMenu
@@ -181,9 +183,21 @@ export default function CommunityPeerDialogList<T>(
     const dispose = createRoot((disposeRoot) => {
       const [item, setItem] = createSignal(initialItem);
       const initialCommunity = props.getCommunity?.(initialItem);
+      const communityAvatar = initialCommunity ?
+        createCommunityAvatarElement(initialCommunity.id, 42) :
+        undefined;
+      const communityAvatarMedia = communityAvatar &&
+        props.getAvatarOverlayPeerId ?
+        document.createElement('div') :
+        undefined;
+      if(communityAvatarMedia) {
+        communityAvatarMedia.classList.add(sharedStyles.avatarMedia);
+        communityAvatar.element.classList.add(sharedStyles.peerAvatar);
+        communityAvatarMedia.append(communityAvatar.element);
+      }
       const peer = usePeer(() => peerId);
       const dialogElement = initialCommunity ?
-        appDialogsManager.addDialogNew({
+        hotReloadGuard.appDialogsManager.addDialogNew({
           peerId,
           container: false,
           autonomous: true,
@@ -192,12 +206,13 @@ export default function CommunityPeerDialogList<T>(
           meAsSaved: false,
           fromName: initialCommunity.title,
           noIcons: true,
+          avatarElement: communityAvatarMedia || communityAvatar.element,
           wrapOptions: {
             middleware: props.middleware
           }
         }) :
         createCommunityDialogElement(
-          appDialogsManager,
+          hotReloadGuard.appDialogsManager,
           peerId,
           {middleware: props.middleware},
           {
@@ -206,6 +221,9 @@ export default function CommunityPeerDialogList<T>(
           },
           false
         );
+      if(communityAvatar) {
+        dialogElement.middlewareHelper.onDestroy(communityAvatar.dispose);
+      }
       const {dom} = dialogElement;
       const element = dom.listEl;
       element.dataset.communityPeerDialog = 'true';
@@ -346,54 +364,27 @@ export default function CommunityPeerDialogList<T>(
       });
 
       if(initialCommunity) {
-        dom.titleSpan.replaceChildren();
-        const disposeTitle = render(
-          () => <>{props.getCommunity?.(item())?.title || ''}</>,
-          dom.titleSpan
-        );
-        onCleanup(disposeTitle);
-      }
-
-      if(props.getAvatarOverlayPeerId || props.getCommunity) {
-        const avatar = dom.avatarEl?.node;
-        const avatarMedia = document.createElement('div');
-        avatarMedia.classList.add(
-          'row-media',
-          'row-media-abitbigger',
-          sharedStyles.avatarMedia
-        );
-        if(avatar) {
-          avatar.classList.remove('row-media', 'row-media-abitbigger');
-          avatar.classList.add(sharedStyles.peerAvatar);
-          avatar.replaceWith(avatarMedia);
-          avatarMedia.append(avatar);
-        } else {
-          element.append(avatarMedia);
-        }
-        dialogElement.media = avatarMedia;
-
-        const communityAvatar = document.createElement('span');
-        avatarMedia.append(communityAvatar);
-        const disposeCommunityAvatar = render(() => (
-          <Show when={props.getCommunity?.(item())}>
-            {(community) => (
-              <CommunityAvatar
-                class={sharedStyles.peerAvatar}
-                community={community()}
-                title={community().title}
-                size={42}
-              />
-            )}
-          </Show>
-        ), communityAvatar);
-        onCleanup(disposeCommunityAvatar);
         createEffect(() => {
-          avatar?.classList.toggle(
-            'hide',
-            !!props.getCommunity?.(item())
+          void dialogElement.updateTitle(
+            props.getCommunity?.(item())?.title || ''
           );
         });
+      }
 
+      if(props.getAvatarOverlayPeerId) {
+        const avatarMedia = communityAvatarMedia ||
+          document.createElement('div');
+        if(!communityAvatarMedia) {
+          const avatar = dom.avatarEl?.node;
+          avatarMedia.classList.add(sharedStyles.avatarMedia);
+          if(avatar) {
+            avatar.classList.add(sharedStyles.peerAvatar);
+          }
+          dialogElement.applyMediaElement(avatarMedia, 'abitbigger');
+          if(avatar) {
+            avatarMedia.append(avatar);
+          }
+        }
         const avatarOverlay = document.createElement('span');
         avatarMedia.append(avatarOverlay);
         const disposeAvatarOverlay = render(() => (

@@ -45,6 +45,15 @@ export default class AppPromoManager extends AppManager {
   private contactBirthdaysState: ContactBirthdaysState;
 
   protected after() {
+    // * the server signals changed suggestions (a required login email, for one) through updateConfig
+    this.apiUpdatesManager.addMultipleEventsListeners({
+      updateConfig: () => {
+        if(this.promoDataLoaded) {
+          void this.getPromoData(true).catch(() => {});
+        }
+      }
+    });
+
     return this.appStateManager.getState().then((state) => {
       this.birthdayContactsDismissedDayKey = state.birthdayContactsDismissedDayKey;
     });
@@ -130,6 +139,24 @@ export default class AppPromoManager extends AppManager {
     };
 
     this.rootScope.dispatchEvent('promo_data_update', this.myPromoData);
+  }
+
+  public async hasPendingSuggestion(suggestion: string) {
+    return (await this.getPromoData()).pendingSuggestions.includes(suggestion);
+  }
+
+  /**
+   * Asks the server again when a suggestion may have appeared that it adds without pushing anything (the
+   * first incoming Gram transfer adds WALLET_FIRST_INCOMING_TRANSFER). One already pending or dismissed cannot.
+   */
+  public invalidateSuggestion(suggestion: string) {
+    const {pendingSuggestions, dismissedSuggestions} = this.myPromoData;
+    if(pendingSuggestions.includes(suggestion) || dismissedSuggestions.includes(suggestion)) {
+      return;
+    }
+
+    // * a burst of such messages is one request: the call is deduplicated while it runs
+    void this.getPromoData(true).catch(() => {});
   }
 
   public dismissSuggestion(suggestion: string) {

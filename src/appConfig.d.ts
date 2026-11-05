@@ -7,6 +7,7 @@ export interface MTAppConfig {
   stickers_emoji_suggest_only_api?:          boolean;
   stickers_emoji_cache_time?:                number;
   groupcall_video_participants_max?:         number;
+  conference_call_size_limit?:               number;
   youtube_pip?:                              string;
   qr_login_camera?:                          boolean;
   qr_login_code?:                            string;
@@ -63,7 +64,12 @@ export interface MTAppConfig {
   reactions_in_chat_max?:                    number;
   default_emoji_statuses_stickerset_id?:     string;
   premium_promo_order?:                      PremiumPromoFeatureType[];
+  business_promo_order?:                     PremiumPromoFeatureType[];
+  business_chat_links_limit?:                number;
+  intro_title_length_limit?:                 number;
+  intro_description_length_limit?:           number;
   premium_bot_username?:                     string;
+  premium_invoice_slug?:                     string;
   premium_playmarket_direct_currency_list?:  string[];
   forum_upgrade_participants_min?:           number;
   whitelisted_domains?:                      string[];
@@ -91,11 +97,19 @@ export interface MTAppConfig {
   stories_stealth_cooldown_period?:          number;
   stories_stealth_future_period?:            number;
   stories_stealth_past_period?:              number;
+  story_viewers_expire_period?:              number;
   giveaway_add_peers_max?:                   number;
   giveaway_boosts_per_premium?:              number;
   giveaway_countries_max?:                   number;
   giveaway_gifts_purchase_available?:        boolean;
   giveaway_period_max?:                      number;
+  ephemeral_welcome_messages_max?:           number;
+  rich_message_length_limit?:                number;
+  rich_message_max_blocks?:                  number;
+  rich_message_max_depth?:                   number;
+  rich_message_max_media?:                   number;
+  rich_message_max_table_cols?:              number;
+  rich_message_posting?:                     'enabled' | 'premium' | 'disabled';
   quote_length_max?:                         number;
   recommended_channels_limit_default?:       number;
   recommended_channels_limit_premium?:       number;
@@ -109,6 +123,7 @@ export interface MTAppConfig {
   stars_purchase_blocked?:                   boolean;
   can_edit_factcheck?:                       boolean;
   message_primary_edited_date?:              boolean;
+  message_typing_draft_ttl?:                 number;
   stories_pinned_to_top_count_max?:          number;
   stars_paid_post_amount_max?:               number;
   stars_gifts_enabled?:                      boolean;
@@ -139,6 +154,12 @@ export interface MTAppConfig {
   verify_age_country?:                       string;
   ton_usd_rate?:                             number;
   ton_topup_url?:                            string;
+  ton_blockchain_explorer_url?:              string;
+  wallet_available?:                         boolean;
+  wallet_transfer_min_nanos?:                number;
+  wallet_gasless_min_nanos?:                 number;
+  wallet_gasless_daily_transfers?:           number;
+  old_wallet_bot_username?:                  string;
   ton_stargift_resale_amount_max?:            number;
   ton_stargift_resale_amount_min?:            number;
   ton_stargift_resale_commission_permille?:   number;
@@ -146,6 +167,7 @@ export interface MTAppConfig {
   stars_stargift_resale_amount_min?:          number;
   stars_stargift_resale_commission_permille?: number;
   channel_autotranslation_level_min?:         number;
+  group_emoji_stickers_level_min?:            number;
   translations_auto_enabled?:                 'enabled' | 'disabled';
   translations_manual_enabled?:               'enabled' | 'disabled';
   freeze_since_date?:                         number;
@@ -159,6 +181,7 @@ export interface MTAppConfig {
   poll_countries_max?:                        number;
   phone_country_iso2?:                        string;
   no_forwards_request_expire_period?:         number;
+  music_search_username?:                     string;
   aicompose_tone_title_length_max?:           number;
   aicompose_tone_prompt_length_max?:          number;
   aicompose_tone_examples_num?:               number;

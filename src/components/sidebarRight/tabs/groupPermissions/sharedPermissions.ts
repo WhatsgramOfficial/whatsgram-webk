@@ -81,6 +81,8 @@ export class ChatPermissions extends CheckboxFields<PermissionsCheckboxFieldsFie
       {flags: ['invite_users'], text: 'UserRestrictionsInviteUsers', exceptionText: 'UserRestrictionsNoInviteUsers'},
       {flags: ['pin_messages'], text: 'UserRestrictionsPinMessages', exceptionText: 'UserRestrictionsNoPinMessages'},
       isForum && {flags: ['manage_topics'], text: 'CreateTopicsPermission', exceptionText: 'UserRestrictionsNoChangeInfo'},
+      // * whether members may set their own tags (desktop puts it right before the group's info)
+      {flags: ['edit_rank'], text: options.forChat ? 'UserRestrictionsEditRank' : 'UserRestrictionsEditRankSingle', exceptionText: 'UserRestrictionsNoEditRank'},
       {flags: ['change_info'], text: 'UserRestrictionsChangeInfo', exceptionText: 'UserRestrictionsNoChangeInfo'}
     ];
     v = v.filter(Boolean);
@@ -192,7 +194,9 @@ export class ChatAdministratorRights extends CheckboxFields<AdministratorRightsC
     onSomethingChanged?: () => void,
     fields?: AdministratorRightsCheckboxFieldsField[],
     canGrant?: (right: ChatRights) => boolean,
-    preserveUnhandledRights?: boolean
+    preserveUnhandledRights?: boolean,
+    // a bot sends the welcome messages itself rather than managing them (desktop's wording)
+    isBot?: boolean
   }) {
     super({
       listenerSetter: options.listenerSetter,
@@ -230,6 +234,11 @@ export class ChatAdministratorRights extends CheckboxFields<AdministratorRightsC
       flags: [...field.flags]
     })) || [
       {flags: ['change_info'], text: isBroadcast ? 'EditAdminChangeChannelInfo' : 'EditAdminChangeGroupInfo'},
+      // three keys, as the API group asked: a bot in a channel, a bot in a group, any user admin;
+      // second in the list, right under the chat info, as in desktop
+      {flags: ['manage_welcome_messages'], text: options.isBot ?
+        (isBroadcast ? 'AdminRights.SendWelcomeMessages' : 'AdminRights.GroupSendWelcomeMessages') :
+        'AdminRights.ManageWelcomeMessages'},
       isBroadcast && {flags: [manageMessagesNestedKey], text: 'AdminRights.ManageMessages', nested: manageMessagesNested},
       isBroadcast && {flags: [manageStoriesNestedKey], text: 'AdminRights.ManageStories', nested: manageStoriesNested},
       !isBroadcast && {flags: ['delete_messages'], text: isBroadcast ? 'EditAdminDeleteMessages' : 'EditAdminGroupDeleteMessages'},
@@ -238,6 +247,8 @@ export class ChatAdministratorRights extends CheckboxFields<AdministratorRightsC
       !isBroadcast && {flags: ['pin_messages'], text: 'EditAdminPinMessages'},
       isForum && {flags: ['manage_topics'], text: 'ManageTopicsPermission'},
       {flags: ['manage_call'], text: isBroadcast ? 'StartVoipChatPermission' : 'Channel.EditAdmin.ManageCalls'},
+      // * others' tags; a basic group's admin is not given it by default, as its legacy rights lack it (desktop)
+      !isBroadcast && {flags: ['manage_ranks'], text: 'EditAdminManageRanks', checked: rights || chat._ !== 'chat' ? undefined : false},
       isBroadcast && {flags: ['invite_users'], text: 'Channel.EditAdmin.PermissionInviteSubscribers'},
       isBroadcast && {flags: ['manage_direct_messages'], text: 'Channel.EditAdmin.ManageDirectMessages'},
       !isBroadcast && {flags: ['anonymous'], text: 'EditAdminSendAnonymously', checked: rights ? undefined : false},
@@ -360,7 +371,7 @@ export const createSolidTabState = <StateStore extends object>({tab, save, alway
   const initialState: StateStore = {} as any;
 
   const [store, set] = createStore<StateStore>({} as StateStore);
-  const [saveIcon, setSaveIcon] = createSignal<HTMLElement>(ButtonIcon('check primary appear-zoom'));
+  const [saveIcon, setSaveIcon] = createSignal<HTMLElement>(ButtonIcon('check primary appear-zoom', {ariaLabel: 'Save'}));
   const [saving, setSaving] = createSignal(false);
   const [valid, setValid] = createSignal(true);
 

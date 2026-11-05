@@ -6,7 +6,7 @@ import type {UserTyping} from '@appManagers/appProfileManager';
 import type {MyDraftMessage} from '@appManagers/appDraftsManager';
 import type {ConnectionStatusChange} from '@lib/mtproto/connectionStatus';
 import type {GroupCallId} from '@appManagers/appGroupCallsManager';
-import type {AppManagers} from '@lib/managers';
+import type {TabManagers} from '@lib/managers';
 import type {GlobalNotifySettingsKey, StateSettings} from '@config/state';
 import type {Progress} from '@lib/appDownloadManager';
 import type {CallId} from '@appManagers/appCallsManager';
@@ -22,6 +22,10 @@ import type {MyPromoData} from '@appManagers/appPromoManager';
 import type {UnconfirmedAuthorization} from '@appManagers/appAccountManager';
 import type {ActiveAccountNumber} from '@lib/accounts/types';
 import type {BotConnectionReview} from '@appManagers/appBusinessManager';
+import type {NotifyException} from '@appManagers/appNotificationsManager';
+import type {StreamedMessageDraft, StreamedMessageDraftRemovalReason} from '@appManagers/utils/messages/streamedMessageDrafts';
+import type {WalletSentTransfer, WalletStatus, WalletTonConnectRequestAction} from '@appManagers/appWalletManager';
+import type {TonConnectSession} from '@layer';
 import {NULL_PEER_ID, UserAuth} from '@appManagers/constants';
 import EventListenerBase, {EventListenerListeners} from '@helpers/eventListenerBase';
 import {MOUNT_CLASS_TO} from '@config/debug';
@@ -32,6 +36,7 @@ export type BroadcastEvents = {
   'chat_update': ChatId,
   'chat_toggle_forum': {chatId: ChatId, enabled: boolean},
   'chat_participant': Update.updateChannelParticipant,
+  'chat_participant_rank': {chatId: ChatId, userId: UserId, rank: string},
   'chat_participation': {chatId: ChatId, left: boolean},
   'chat_requests': {requestsPending: number, recentRequesters: UserId[], chatId: ChatId}
 
@@ -45,8 +50,9 @@ export type BroadcastEvents = {
 
   'emoji_status_change': void,
 
-  'peer_pinned_messages': {peerId: PeerId, mids?: number[], pinned?: boolean, unpinAll?: true},
-  'peer_pinned_hidden': {peerId: PeerId, maxId: number},
+  /** `threadId` scopes the change to one forum topic; absent = the whole peer. */
+  'peer_pinned_messages': {peerId: PeerId, threadId?: number, mids?: number[], pinned?: boolean, unpinAll?: true},
+  'peer_pinned_hidden': {peerId: PeerId, threadId?: number, maxId: number},
   'peer_typings': {peerId: PeerId, threadId?: number, typings: UserTyping[]},
   'peer_block': {peerId: PeerId, blocked?: boolean, blockedMyStoriesFrom?: boolean},
   'peer_title_edit': {peerId: PeerId, threadId?: number},
@@ -95,6 +101,11 @@ export type BroadcastEvents = {
   'ephemeral_send_error': {peerId: PeerId, retryId: number},
 
   'message_edit': {storageKey: MessagesStorageKey, peerId: PeerId, mid: number, message: MyMessage},
+  'peer_history_flush': {peerId: PeerId},
+  'streamed_message_update': {draft: StreamedMessageDraft, message: Message.message, initial: boolean},
+  'streamed_message_remove': {draft: StreamedMessageDraft, reason: StreamedMessageDraftRemovalReason},
+  'streamed_message_finalize': {draft: StreamedMessageDraft, tempId: number, finalMessage: MyMessage},
+  'streamed_message_stoppable': {peerId: PeerId, threadId: number, stoppable: boolean},
   'message_sent': {storageKey: MessagesStorageKey, tempId: number, tempMessage: any, mid: number, message: MyMessage},
   'message_error': {storageKey: MessagesStorageKey, peerId: PeerId, tempId: number, error: ApiError},
   'message_transcribed': {peerId: PeerId, mid: number, text: string, pending?: boolean},
@@ -117,18 +128,22 @@ export type BroadcastEvents = {
   'story_album_created': {peerId: PeerId, albumId: number, albums: StoryAlbum[]},
   'story_album_updated': {peerId: PeerId, albumId: number, addStories?: StoryItem.storyItem[], deleteStories?: number[], albums: StoryAlbum[]},
   'story_album_deleted': {peerId: PeerId, albumId: number, albums: StoryAlbum[]},
+  'story_albums_updated': {peerId: PeerId, albums: StoryAlbum[]},
 
   'replies_updated': Message.message,
   'replies_short_update': Message.message,
 
   'scheduled_new': Message.message,
   'scheduled_delete': {peerId: PeerId, mids: number[]},
+  'welcome_message_new': Message.message,
+  'welcome_messages_delete': {peerId: PeerId, mids: number[]},
 
   'grouped_edit': {peerId: PeerId, groupedId: string, deletedMids: number[], messages: Message.message[]},
 
   'stickers_installed': StickerSet.stickerSet,
   'stickers_deleted': StickerSet.stickerSet,
-  'stickers_updated': {type: 'recent' | 'faved', stickers: MyDocument[]},
+  // * `reverted`: a change of the user's own that the server did not take, put back
+  'stickers_updated': {type: 'recent' | 'faved', stickers: MyDocument[], reverted?: boolean},
   'stickers_top': Long,
   'stickers_order': {type: 'masks' | 'emojis' | 'stickers', order: Long[]},
   'sticker_updated': {type: 'recent' | 'faved', document: MyDocument, faved: boolean, limitReached?: boolean},
@@ -159,9 +174,16 @@ export type BroadcastEvents = {
 
   'notify_settings': Update.updateNotifySettings,
   'notify_peer_type_settings': {key: GlobalNotifySettingsKey, settings: PeerNotifySettings},
+  'notify_exceptions': {key: GlobalNotifySettingsKey, exceptions: NotifyException[]},
+  'notify_settings_reset': void,
 
   'notification_reset': string,
-  'notification_cancel': `msg_${ActiveAccountNumber}_${PeerId}_${number}` | `story_${ActiveAccountNumber}_${PeerId}_${number}`,
+  'notification_cancel': `msg_${ActiveAccountNumber}_${PeerId}_${number}` |
+    `story_${ActiveAccountNumber}_${PeerId}_${number}` |
+    `storyReaction_${ActiveAccountNumber}_${PeerId}_${number}`,
+  // * `notification_cancel` can only be fired for messages that are in memory, this one covers
+  // * the whole read range (e.g. a read that came from another client after a restart)
+  'notification_cancel_up_to': {accountNumber: ActiveAccountNumber, peerId: PeerId, maxId: number},
 
   'notification_count_update': void,
 
@@ -207,11 +229,21 @@ export type BroadcastEvents = {
 
   'premium_toggle': boolean,
   'premium_toggle_private': {isNew: boolean, isPremium: boolean},
+  // * a Premium account's Do Not Hide Ads, once the server took it
+  'sponsored_messages_toggle': boolean,
 
   'saved_tags': {savedPeerId: PeerId, tags: SavedReactionTag[]},
   'saved_tags_clear': void,
 
   'stars_balance': {balance: Long, fulfilledReservedStars?: number, ton: boolean},
+
+  'wallet_status': WalletStatus,
+  'wallet_transfer_sent': WalletSentTransfer,
+  'wallet_tonconnect_session': TonConnectSession,
+  /** sessions the server wants the wallet to close: the dApp went away */
+  'wallet_tonconnect_pending_disconnect': string[],
+  /** a dApp's request in the service chat, new or answered */
+  'wallet_tonconnect_request': WalletTonConnectRequestAction,
 
   'file_speed_limited': {increaseTimes: number, isUpload: boolean},
 
@@ -220,6 +252,8 @@ export type BroadcastEvents = {
   'managers_ready': void, // ! inner
 
   'account_logged_in': {accountNumber: ActiveAccountNumber, userId: UserId},
+  // * tab-local: this tab now shows another signed-in account, its mirrors and state already in place
+  'account_switched': {from: ActiveAccountNumber, to: ActiveAccountNumber},
 
   'resizing_left_sidebar': void,
   'right_sidebar_toggle': boolean,
@@ -239,6 +273,7 @@ export type BroadcastEvents = {
   },
   'pinned_stargifts': {peerId: PeerId, gifts: InputSavedStarGift[]},
   'star_gift_list_update': {peerId: PeerId},
+  'saved_music_update': {peerId: PeerId},
   'star_gift_upgrade': {gift: MyStarGift, savedId?: Long, fromMsgId?: number},
 
   'insufficent_stars_for_message': {messageCount: number, requestId: number, invokeApiArgs: Parameters<ApiManager['invokeApi']>, reservedStars?: number};
@@ -250,6 +285,7 @@ export type BroadcastEvents = {
   'monoforum_draft_update': {dialog: MonoforumDialog},
 
   'botforum_pending_topic_created': {peerId: PeerId, tempId: number, newId?: number},
+  'botforum_pending_topic_failed': {peerId: PeerId, tempId: number},
   'promo_data_update': MyPromoData,
   'unconfirmed_authorizations_update': UnconfirmedAuthorization[],
 
@@ -263,7 +299,7 @@ export type BroadcastEventsListeners = {
 export class RootScope extends EventListenerBase<BroadcastEventsListeners> {
   public myId: PeerId;
   private connectionStatus: {[name: string]: ConnectionStatusChange};
-  public managers: AppManagers;
+  public managers: TabManagers;
   public premium: boolean;
 
   constructor() {
@@ -318,6 +354,19 @@ export class RootScope extends EventListenerBase<BroadcastEventsListeners> {
     ...args: ArgumentTypes<L[T]>
   ) {
     super.dispatchEvent(name, ...args);
+  }
+
+  /**
+   * About what belongs to an account the tab may no longer show (a call's): this tab hears it at once, the
+   * other tabs as that account's - `dispatchEvent` would name the account the tab shows.
+   */
+  public dispatchEventOfAccount<T extends keyof BroadcastEventsListeners>(
+    accountNumber: ActiveAccountNumber,
+    name: T,
+    ...args: ArgumentTypes<BroadcastEventsListeners[T]>
+  ) {
+    super.dispatchEvent(name, ...args);
+    MTProtoMessagePort.getInstance().invokeVoid('event', {name, args, accountNumber});
   }
 }
 

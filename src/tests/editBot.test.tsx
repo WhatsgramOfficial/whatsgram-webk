@@ -39,6 +39,10 @@ vi.mock('@components/buttonTsx', () => {
   };
 });
 
+vi.mock('@components/stars/transactionHistory', () => ({
+  default: (): null => null
+}));
+
 vi.mock('@components/communities/editBotCommunitySection', () => ({
   default: (): null => null
 }));
@@ -88,7 +92,7 @@ vi.mock('@components/usernameInputFieldTsx', () => ({
   }
 }));
 
-vi.mock('@components/usernamesSectionTsx', () => ({
+vi.mock('@components/usernamesSection', () => ({
   default: (): null => null
 }));
 

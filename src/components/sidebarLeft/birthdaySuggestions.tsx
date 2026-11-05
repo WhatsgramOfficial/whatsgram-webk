@@ -1,18 +1,17 @@
 import type {ContactBirthdaysState} from '@appManagers/appPromoManager';
-import PopupElement from '@components/popups';
 import showBirthdayPopup, {saveMyBirthday} from '@components/popups/birthday';
-import showPickUserPopup from '@components/popups/pickUser';
-import PopupSendGift from '@components/popups/sendGift';
+import showSendGiftPicker from '@components/popups/sendGiftPicker';
+import showSendGiftPopup from '@components/popups/sendGift';
 import RippleElement from '@components/rippleElement';
 import Row from '@components/rowTsx';
 import birthdayStyles from '@components/sidebarLeft/birthdaySuggestions.module.scss';
 import type {PendingSuggestionController} from '@components/sidebarLeft/pendingSuggestionController';
 import {PendingSuggestion, SimpleSuggestion} from '@components/sidebarLeft/pendingSuggestionItem';
 import suggestionStyles from '@components/sidebarLeft/pendingSuggestion.module.scss';
+import collapsedPanelStyles from '@components/sidebarLeft/collapsedPanelButton.module.scss';
 import {StackedAvatarsTsx} from '@components/stackedAvatars';
 import {toastNew} from '@components/toast';
 import getPeerTitle from '@components/wrappers/getPeerTitle';
-import {IS_PREVIEW} from '@config/debug';
 import classNames from '@helpers/string/classNames';
 import {i18n} from '@lib/langPack';
 import wrapEmojiText from '@lib/richTextProcessor/wrapEmojiText';
@@ -21,16 +20,10 @@ import {useAppState} from '@stores/appState';
 import {useIsSidebarCollapsed} from '@stores/foldersSidebar';
 import {useDismissedSuggestions, usePendingSuggestions, usePromoDataLoaded} from '@stores/promo';
 import {createEffect, createMemo, createResource, createSignal, onCleanup, onMount, Show} from 'solid-js';
+import {bindManagersToSession} from '@lib/accounts/bindManagersToAccount';
 
 const BIRTHDAY_CONTACTS_TODAY_SUGGESTION_KEY = 'BIRTHDAY_CONTACTS_TODAY';
 const BIRTHDAY_SETUP_SUGGESTION_KEY = 'BIRTHDAY_SETUP';
-
-// Preview-only: 1 opens the gift popup directly, 2+ opens the recipient picker.
-// Leave peer ids empty to use real contacts from the current preview account.
-const TEST_BIRTHDAY_CONTACTS = IS_PREVIEW && true;
-const TEST_BIRTHDAY_CONTACTS_TODAY_COUNT = 1;
-const TEST_BIRTHDAY_CONTACTS_INCLUDE_NEARBY = true;
-const TEST_BIRTHDAY_CONTACT_PEER_IDS: PeerId[] = [];
 
 const EMPTY_CONTACT_BIRTHDAYS: ContactBirthdaysState = {
   contacts: [],
@@ -38,63 +31,6 @@ const EMPTY_CONTACT_BIRTHDAYS: ContactBirthdaysState = {
   today: [],
   tomorrow: []
 };
-
-function getTestBirthdayContact(peerId: PeerId, dayOffset: number) {
-  const date = new Date();
-  date.setDate(date.getDate() + dayOffset);
-
-  return {
-    peerId,
-    birthday: {
-      _: 'birthday' as const,
-      day: date.getDate(),
-      month: date.getMonth() + 1
-    }
-  };
-}
-
-async function getTestContactBirthdays(state: ContactBirthdaysState): Promise<ContactBirthdaysState> {
-  const nearbyCount = TEST_BIRTHDAY_CONTACTS_INCLUDE_NEARBY ? 2 : 0;
-  const requiredCount = TEST_BIRTHDAY_CONTACTS_TODAY_COUNT + nearbyCount;
-  const peerIds = [...new Set(TEST_BIRTHDAY_CONTACT_PEER_IDS)];
-
-  if(peerIds.length < requiredCount) {
-    const contactPeerIds = await rootScope.managers.appUsersManager.getContactsPeerIds(
-      '',
-      false,
-      'none',
-      Math.max(requiredCount * 4, 20)
-    );
-    const candidates = [...new Set([
-      ...state.contacts.map(({peerId}) => peerId),
-      ...contactPeerIds
-    ])].slice(0, Math.max(requiredCount * 4, 20));
-    const areRegularUsers = await Promise.all(candidates.map((peerId) => (
-      rootScope.managers.appPeersManager.isRegularUser(peerId)
-    )));
-
-    for(let i = 0; i < candidates.length && peerIds.length < requiredCount; ++i) {
-      const peerId = candidates[i];
-      if(areRegularUsers[i] && !peerIds.includes(peerId)) peerIds.push(peerId);
-    }
-  }
-
-  const today = peerIds
-  .slice(0, TEST_BIRTHDAY_CONTACTS_TODAY_COUNT)
-  .map((peerId) => getTestBirthdayContact(peerId, 0));
-  const yesterday = TEST_BIRTHDAY_CONTACTS_INCLUDE_NEARBY && peerIds[TEST_BIRTHDAY_CONTACTS_TODAY_COUNT] ?
-    [getTestBirthdayContact(peerIds[TEST_BIRTHDAY_CONTACTS_TODAY_COUNT], -1)] : [];
-  const tomorrowPeerId = peerIds[TEST_BIRTHDAY_CONTACTS_TODAY_COUNT + 1];
-  const tomorrow = TEST_BIRTHDAY_CONTACTS_INCLUDE_NEARBY && tomorrowPeerId ?
-    [getTestBirthdayContact(tomorrowPeerId, 1)] : [];
-
-  return {
-    contacts: [...today, ...yesterday, ...tomorrow],
-    yesterday,
-    today,
-    tomorrow
-  };
-}
 
 function BirthdaySetupSuggestion() {
   const emoji = () => wrapEmojiText('🎂');
@@ -106,8 +42,9 @@ function BirthdaySetupSuggestion() {
   const onClick = () => {
     showBirthdayPopup({
       onSave: async(date) => {
+        const managers = bindManagersToSession(rootScope.managers);
         if(await saveMyBirthday(date)) {
-          rootScope.managers.appPromoManager.dismissSuggestion(BIRTHDAY_SETUP_SUGGESTION_KEY);
+          managers.appPromoManager.dismissSuggestion(BIRTHDAY_SETUP_SUGGESTION_KEY);
           return;
         }
         return false;
@@ -149,7 +86,7 @@ function BirthdayContactsSuggestion(props: {
   const todayPeerIds = createMemo(() => new Set(props.state.today.map(({peerId}) => peerId)));
 
   const openGift = (peerId: PeerId) => {
-    PopupElement.createPopup(PopupSendGift, {peerId, birthday: birthdayPeerIds().has(peerId)});
+    showSendGiftPopup({peerId, birthday: birthdayPeerIds().has(peerId)});
   };
 
   const onClick = () => {
@@ -158,11 +95,7 @@ function BirthdayContactsSuggestion(props: {
       return;
     }
 
-    showPickUserPopup({
-      titleLangKey: 'SendGiftTo',
-      placeholder: 'Chat.Menu.SendGift',
-      selfPresence: 'SendGiftSelfCaption',
-      meAsSaved: false,
+    showSendGiftPicker({
       prependPeerIds: nearbyContacts().map(({peerId}) => peerId),
       getSubtitleForElement: (peerId) => {
         const key = todayPeerIds().has(peerId) ? 'Suggestion.BirthdayContacts.Today' :
@@ -170,8 +103,7 @@ function BirthdayContactsSuggestion(props: {
           birthdayPeerIds().has(peerId) ? 'Suggestion.BirthdayContacts.Tomorrow' : undefined;
         return key ? i18n(key) : undefined;
       },
-      onSelect: ([{peerId}]) => openGift(peerId),
-      filterPeerTypeBy: ['isRegularUser', 'isBroadcast']
+      onSelect: ([{peerId}]) => openGift(peerId)
     });
   };
 
@@ -203,7 +135,7 @@ function BirthdayContactsSuggestion(props: {
     >
       <RippleElement
         component="div"
-        class={classNames(suggestionStyles.collapsed, birthdayStyles.collapsed, 'hover-effect')}
+        class={classNames(collapsedPanelStyles.button, birthdayStyles.collapsed, 'hover-effect')}
         onClick={onClick}
       >
         <div class={birthdayStyles.avatars}>
@@ -225,24 +157,22 @@ export default function createBirthdaySuggestions() {
   const [contactBirthdays, setContactBirthdays] = createSignal<ContactBirthdaysState>();
   let contactBirthdaysRequest = 0;
   let midnightTimeout: number;
+  let contactBirthdaysDay = new Date().toDateString();
   let destroyed = false;
 
-  const canLoadBirthdayContacts = () => TEST_BIRTHDAY_CONTACTS || !appConfig.premium_purchase_blocked;
+  const canLoadBirthdayContacts = () => !appConfig.premium_purchase_blocked;
   const canShowBirthdayContacts = () => (
-    TEST_BIRTHDAY_CONTACTS || (
-      canLoadBirthdayContacts() &&
-      promoDataLoaded() &&
-      !dismissedSuggestions().has(BIRTHDAY_CONTACTS_TODAY_SUGGESTION_KEY)
-    )
+    canLoadBirthdayContacts() &&
+    promoDataLoaded() &&
+    !dismissedSuggestions().has(BIRTHDAY_CONTACTS_TODAY_SUGGESTION_KEY)
   );
 
   const loadContactBirthdays = async(force = false) => {
     const request = ++contactBirthdaysRequest;
 
     try {
-      const liveState = await rootScope.managers.appPromoManager.getContactBirthdays(force)
+      const state = await rootScope.managers.appPromoManager.getContactBirthdays(force)
       .catch(() => EMPTY_CONTACT_BIRTHDAYS);
-      const state = TEST_BIRTHDAY_CONTACTS ? await getTestContactBirthdays(liveState) : liveState;
       if(!destroyed && request === contactBirthdaysRequest) {
         setContactBirthdays(state);
       }
@@ -254,25 +184,55 @@ export default function createBirthdaySuggestions() {
   };
 
   const scheduleMidnightRefresh = () => {
+    window.clearTimeout(midnightTimeout);
     const now = new Date();
     const nextMidnight = new Date(now);
     nextMidnight.setHours(24, 0, 0, 0);
 
     midnightTimeout = window.setTimeout(() => {
-      setContactBirthdays(undefined);
+      refreshForNewDay();
       scheduleMidnightRefresh();
-      void Promise.all([
-        rootScope.managers.appPromoManager.getPromoData(true).catch(() => {}),
-        loadContactBirthdays(true)
-      ]);
     }, nextMidnight.getTime() - now.getTime());
   };
 
-  onMount(scheduleMidnightRefresh);
+  const refreshForNewDay = () => {
+    const day = new Date().toDateString();
+    if(day === contactBirthdaysDay) return;
+    contactBirthdaysDay = day;
+    ++contactBirthdaysRequest;
+    setContactBirthdays(undefined);
+    void rootScope.managers.appPromoManager.getPromoData(true).catch(() => {});
+    if(canLoadBirthdayContacts()) void loadContactBirthdays(true);
+  };
+
+  const onVisible = () => {
+    if(document.visibilityState !== 'visible') return;
+    refreshForNewDay();
+    scheduleMidnightRefresh();
+  };
+
+  // * the birthdays are of the account's own contacts: the suggestions outlive a switch, the list starts over
+  const onAccountSwitched = () => {
+    ++contactBirthdaysRequest;
+    setContactBirthdays(undefined);
+    if(canLoadBirthdayContacts()) {
+      void loadContactBirthdays();
+    }
+  };
+  rootScope.addEventListener('account_switched', onAccountSwitched);
+
+  onMount(() => {
+    scheduleMidnightRefresh();
+    document.addEventListener('visibilitychange', onVisible);
+    window.addEventListener('focus', onVisible);
+  });
   onCleanup(() => {
     destroyed = true;
     ++contactBirthdaysRequest;
     window.clearTimeout(midnightTimeout);
+    document.removeEventListener('visibilitychange', onVisible);
+    window.removeEventListener('focus', onVisible);
+    rootScope.removeEventListener('account_switched', onAccountSwitched);
   });
 
   createEffect(() => {
@@ -294,9 +254,7 @@ export default function createBirthdaySuggestions() {
   const dismissBirthdayContacts = () => {
     ++contactBirthdaysRequest;
     setContactBirthdays(undefined);
-    if(!TEST_BIRTHDAY_CONTACTS) {
-      rootScope.managers.appPromoManager.dismissSuggestion(BIRTHDAY_CONTACTS_TODAY_SUGGESTION_KEY);
-    }
+    rootScope.managers.appPromoManager.dismissSuggestion(BIRTHDAY_CONTACTS_TODAY_SUGGESTION_KEY);
     toastNew({langPackKey: 'Suggestion.BirthdayContacts.Dismissed'});
   };
 

@@ -66,6 +66,8 @@ export default function createStickerAppearance({container, thumbKey, middleware
   const upgradeToImage = (image: HTMLImageElement, onApplied?: VoidFunction) => {
     if(!canBuildImage()) return onApplied?.();
 
+    image.alt = '';
+
     // gate the swap on decode so a not-yet-decoded img can't paint blank over the
     // silhouette for a frame (instant when cached; on failure keep what we have)
     (image.decode ? image.decode() : Promise.resolve()).then(() => {
@@ -93,12 +95,16 @@ export default function createStickerAppearance({container, thumbKey, middleware
     underlay = undefined;
     previous.length = 0;
 
+    // Cross-fade the canvas over the lightweight vector silhouette. A raster underlay stays
+    // fully opaque until the removal below, so fading over one would keep showing the loading
+    // state after the media became available. Callers that render an already-settled frame
+    // (such as a read dice) explicitly opt out with needFadeIn=false.
     const fade = needFadeIn !== false &&
       (needFadeIn || !top || top.tagName === 'svg') &&
       liteMode.isAvailable('animations');
 
     // the canvas is attached and on top of the thumb by now (the player mounts it before
-    // firstFrame); cross-fade it in over the still-opaque thumb on cold start
+    // firstFrame); fade it in over an empty cell or the vector silhouette on cold start
     if(fade && canvas) {
       canvas.classList.add('fade-in');
       await whenAnimationEnd(canvas, 400);

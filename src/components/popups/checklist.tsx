@@ -1,3 +1,5 @@
+import attachPlainMessageEditor from '@components/chat/inputEditor/plainField';
+import type {ChatInputEditor} from '@components/chat/inputEditor/types';
 import {createSignal, For, onCleanup, onMount, Show, untrack, useContext} from 'solid-js';
 import PopupElement, {createPopup, PopupContext} from '@components/popups/indexTsx';
 
@@ -17,8 +19,7 @@ import ListenerSetter from '@helpers/listenerSetter';
 import {I18nTsx} from '@helpers/solid/i18n';
 import classNames from '@helpers/string/classNames';
 import {InputMedia, Message, MessageMedia, TodoItem} from '@layer';
-import {i18n, LangPackKey} from '@lib/langPack';
-import {wrapEmojiTextWithEntities} from '@lib/richTextProcessor/wrapEmojiText';
+import I18n, {i18n, LangPackKey} from '@lib/langPack';
 
 import css from '@components/popups/checklist.module.scss';
 
@@ -36,7 +37,10 @@ export default function showChecklistPopup(options: ChecklistPopupOptions): void
     editMessage ? 'EditChecklist' : 'NewChecklist';
   const confirmKey: LangPackKey = editMessage ? 'Save' : 'Create';
 
-  type Item = {id: number, existing: boolean, field: InputField};
+  type Item = {id: number, existing: boolean, field: InputField, editor: ChatInputEditor};
+
+  // * the task it opens on: a field of a popup not shown yet takes no focus, the popup gives it once it shows
+  let openFocusField: HTMLElement;
 
   function Inner() {
     const context = useContext(PopupContext);
@@ -45,6 +49,14 @@ export default function showChecklistPopup(options: ChecklistPopupOptions): void
     const listenerSetter = new ListenerSetter();
 
     onCleanup(() => listenerSetter.removeAll());
+
+    // The fields are built once the app config resolves, where Solid has no
+    // owner left to register a cleanup with, so it is registered here.
+    let titleInputEditor: ChatInputEditor;
+    onCleanup(() => {
+      titleInputEditor?.destroy();
+      items().forEach((item) => item.editor.destroy());
+    });
 
     const [items, setItems] = createSignal<Item[]>([]);
     const [valid, setValid] = createSignal(false);
@@ -75,6 +87,10 @@ export default function showChecklistPopup(options: ChecklistPopupOptions): void
         name: 'title',
         canBeEdited: !appending
       });
+      _titleInput.input.setAttribute('aria-label', I18n.format('NewChecklist.TitlePlaceholder', true));
+
+      // Title and tasks travel as text plus entities and hold one line each.
+      titleInputEditor = attachPlainMessageEditor(_titleInput.input);
 
       const updateConfirmButton = () => {
         const ok = (() => {
@@ -105,8 +121,10 @@ export default function showChecklistPopup(options: ChecklistPopupOptions): void
           maxLength: itemLengthMax,
           canBeEdited: !(existing && appending)
         });
+        field.input.setAttribute('aria-label', I18n.format('NewChecklist.TaskPlaceholder', true));
+        const editor = attachPlainMessageEditor(field.input);
         if(existing) {
-          field.setValueSilently(wrapEmojiTextWithEntities(existing.title), true);
+          field.setValueSilently(existing.title, true);
         }
         listenerSetter.add(field.input)('input', updateConfirmButton);
         setItems((v) => {
@@ -114,18 +132,26 @@ export default function showChecklistPopup(options: ChecklistPopupOptions): void
           if(existing) id = existing.id;
           else if(v.length > 0) id = v[v.length - 1].id + 1;
           else id = 0;
-          return [...v, {id, existing: !!existing, field}];
+          return [...v, {id, existing: !!existing, field, editor}];
         });
         updateConfirmButton();
         if(!existing || existing.id === focusItemId) {
-          fastRaf(() => {
-            field.input.focus();
-          });
+          if(context.shown()) {
+            fastRaf(() => {
+              field.input.focus();
+            });
+          } else {
+            openFocusField = field.input;
+          }
         }
       };
 
       removeItem = (id: number) => {
-        setItems((v) => v.filter((it) => it.id !== id));
+        setItems((v) => v.filter((it) => {
+          if(it.id !== id) return true;
+          it.editor.destroy();
+          return false;
+        }));
         updateConfirmButton();
       };
 
@@ -229,7 +255,7 @@ export default function showChecklistPopup(options: ChecklistPopupOptions): void
       };
 
       if(editMessage) {
-        _titleInput.setValueSilently(wrapEmojiTextWithEntities(editMessage.media.todo.title), true);
+        _titleInput.setValueSilently(editMessage.media.todo.title, true);
         for(const item of editMessage.media.todo.list) {
           addItem(item);
         }
@@ -263,7 +289,7 @@ export default function showChecklistPopup(options: ChecklistPopupOptions): void
         </PopupElement.Header>
         <PopupElement.Scrollable>
           <Show when={titleInput()}>
-            <Section class={css.titleSection} noShadow noDelimiter>
+            <Section noShadow noDelimiter>
               {titleInput().container}
             </Section>
             <Section name="Checklist">
@@ -281,6 +307,7 @@ export default function showChecklistPopup(options: ChecklistPopupOptions): void
                       <ButtonIconTsx
                         class={css.itemRemoveButton}
                         icon="close"
+                        aria-label={I18n.format('Delete', true)}
                         onClick={() => removeItem?.(item.id)}
                       />
                     )}
@@ -289,7 +316,7 @@ export default function showChecklistPopup(options: ChecklistPopupOptions): void
               </For>
               <Show when={items().length < maxItems()}>
                 <Button
-                  class={`btn-transparent ${css.addTaskButton}`}
+                  class={`btn-primary btn-transparent ${css.addTaskButton}`}
                   icon="add"
                   onClick={() => addItem?.()}
                   text="ChecklistAddTask"
@@ -328,7 +355,7 @@ export default function showChecklistPopup(options: ChecklistPopupOptions): void
   }
 
   createPopup(() => (
-    <PopupElement class={`${css.popup} popup-new-media`}>
+    <PopupElement class={`${css.popup} popup-new-media`} initialFocus={() => openFocusField}>
       <Inner />
     </PopupElement>
   ));

@@ -62,6 +62,11 @@ vi.mock('@components/inputField', () => ({
   }
 }));
 
+// * a community has no member tags, and the editor's preview would bring the whole chat in
+vi.mock('@components/memberTag/memberTagEditor', () => ({
+  default: (): undefined => undefined
+}));
+
 vi.mock('@components/popups/channelsTooMuch', () => ({
   handleChannelsTooMuch: (callback: () => Promise<unknown>) => callback()
 }));
@@ -114,7 +119,8 @@ vi.mock('@lib/apiManagerProxy', () => ({
 
 vi.mock('@lib/langPack', () => ({
   default: {
-    getIsRTL: () => false
+    getIsRTL: () => false,
+    format: (key: string) => key
   },
   i18n: (key: string) => document.createTextNode(key),
   i18n_: (options: {element: HTMLElement, key: string}) => {
@@ -141,6 +147,16 @@ vi.mock('@lib/rootScope', () => ({
 
 import UserPermissions
 from '@components/sidebarRight/tabs/userPermissions';
+import * as mocked1 from '@lib/appDialogsManager';
+import * as mocked2 from '@lib/appImManager';
+import {registerHotReloadGuard} from '@lib/solidjs/hotReloadGuardProvider';
+
+// the code under test reads the top level from the registry, not from the modules mocked above
+registerHotReloadGuard({
+  appDialogsManager: (mocked1 as any).default,
+  appImManager: (mocked2 as any).default
+});
+
 
 const communityId = 10 as ChatId;
 const participantId = (20 as UserId).toPeerId(false);
@@ -176,10 +192,13 @@ describe('community admin rights shared tab', () => {
         type: string,
         listener: EventListenerOrEventListenerObject,
         options?: AddEventListenerOptions
-      ) => target.removeEventListener(type, listener, options)
+      ) => target.removeEventListener(type, listener, options),
+      addCleanup: () => () => true
     };
     const middleware = {
-      onDestroy: vi.fn()
+      onDestroy: vi.fn(),
+      // the sections are mounted through wrapSolidComponent, which parks its dispose here
+      onClean: vi.fn()
     };
     const participant = {
       _: 'channelParticipantAdmin',

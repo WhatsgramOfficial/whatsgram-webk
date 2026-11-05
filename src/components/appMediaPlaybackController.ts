@@ -6,7 +6,8 @@ import {IS_APPLE, IS_SAFARI} from '@environment/userAgent';
 import {MOUNT_CLASS_TO} from '@config/debug';
 import {getAppWindow} from '@helpers/appWindow';
 import simulateEvent from '@helpers/dom/dispatchEvent';
-import {Document, DocumentAttribute, Message, PhotoSize} from '@layer';
+import {Document, Message, PhotoSize} from '@layer';
+import getAudioTitles from '@appManagers/utils/docs/getAudioTitles';
 import IS_TOUCH_SUPPORTED from '@environment/touchSupport';
 import I18n from '@lib/langPack';
 import SearchListLoader from '@helpers/searchListLoader';
@@ -15,7 +16,7 @@ import deepEqual from '@helpers/object/deepEqual';
 import clamp from '@helpers/number/clamp';
 import ListenerSetter from '@helpers/listenerSetter';
 import MusicListenTracker from '@helpers/musicListenTracker';
-import {AppManagers} from '@lib/managers';
+import {TabManagers} from '@lib/managers';
 import getMediaFromMessage from '@appManagers/utils/messages/getMediaFromMessage';
 import getPeerTitle from '@components/wrappers/getPeerTitle';
 import appDownloadManager from '@lib/appDownloadManager';
@@ -29,6 +30,7 @@ import clearMediaElementSource from '@helpers/dom/clearMediaElementSource';
 import createMediaMetadataObjectURLPins from '@helpers/mediaMetadataObjectURLPins';
 import type {Middleware} from '@helpers/middleware';
 import ListLoader, {ListLoaderOptions} from '../helpers/listLoader';
+import {bindManagersToSession} from '@lib/accounts/bindManagersToAccount';
 
 // TODO: Safari: проверить стрим, включить его и сразу попробовать включить видео или другую песню
 // TODO: Safari: попробовать замаскировать подгрузку последнего чанка
@@ -163,7 +165,7 @@ export class AppMediaPlaybackController extends EventListenerBase<{
   };
 
   private pip: HTMLVideoElement;
-  private managers: AppManagers;
+  private managers: TabManagers;
   private skipMediaPlayEvent: boolean;
 
   private gainAudioContext: AudioContext;
@@ -174,7 +176,7 @@ export class AppMediaPlaybackController extends EventListenerBase<{
   private musicListenTracker: MusicListenTracker;
   private setMediaMetadata = createMediaMetadataObjectURLPins();
 
-  construct(managers: AppManagers) {
+  construct(managers: TabManagers) {
     this.managers = managers;
     this.musicListenTracker = new MusicListenTracker((inputDoc, listenedDuration) => {
       // Fire-and-forget analytics — swallow errors (e.g. a stale file_reference) so they don't surface.
@@ -332,6 +334,14 @@ export class AppMediaPlaybackController extends EventListenerBase<{
    */
   private getVolumeForType(mediaType: PlaybackMediaType) {
     return mediaType === 'voice' ? clamp(this._volume + this._boost, 0, 2) : this._volume;
+  }
+
+  /**
+   * A video the controller does not play itself (one autoplaying in a chat, a peek at one) sounds as
+   * loud as everything else - or is silent, when everything is.
+   */
+  public applySharedVolume(video: HTMLVideoElement) {
+    this.applyVolumeToMedia(video, this.getVolumeForType('video'), this.muted, 'video');
   }
 
   private applyVolumeToMedia(
@@ -678,6 +688,7 @@ export class AppMediaPlaybackController extends EventListenerBase<{
   }
 
   private async setNewMediadata(message: Message.message, playingMedia = this.playingMedia) {
+    const managers = bindManagersToSession(this.managers);
     if(getAppWindow().document.pictureInPictureElement) {
       return;
     }
@@ -716,7 +727,7 @@ export class AppMediaPlaybackController extends EventListenerBase<{
       }
     } else if(isVoice) {
       const peerId = message.fromId || message.peerId;
-      const peerPhoto = await this.managers.appPeersManager.getPeerPhoto(peerId);
+      const peerPhoto = await managers.appPeersManager.getPeerPhoto(peerId);
       if(peerPhoto) {
         // const result = this.managers.appAvatarsManager.loadAvatar(peerId, peerPhoto, 'photo_small');
         // if(result.cached) {
@@ -742,9 +753,9 @@ export class AppMediaPlaybackController extends EventListenerBase<{
     }
 
     if(!isVoice) {
-      const attribute = doc.attributes.find((attribute) => attribute._ === 'documentAttributeAudio') as DocumentAttribute.documentAttributeAudio;
-      title = attribute?.title ?? doc.file_name;
-      artist = attribute?.performer;
+      const titles = getAudioTitles(doc);
+      title = titles?.title;
+      artist = titles?.performer;
     }
 
     if(!artwork.length) {
@@ -772,6 +783,12 @@ export class AppMediaPlaybackController extends EventListenerBase<{
           });
         });
       }
+    }
+
+    // * the track went while its sender was read (another track, an account switch that stopped it): the
+    // * OS media panel is not given the name of what no longer plays
+    if(this.playingMedia !== playingMedia) {
+      return;
     }
 
     const metadata = new MediaMetadata({
@@ -818,6 +835,11 @@ export class AppMediaPlaybackController extends EventListenerBase<{
       message,
       media: playingMedia,
       isSavedMusic: Boolean(message.pFlags.fakeForSavedMusic),
+      /**
+       * The message was built only to render a row (the music picker's preview list) and lives
+       * nowhere else — there is no chat message behind it to open.
+       */
+      isLocal: Boolean(message.pFlags.local),
       /**
        * True when the media was added with a non-zero `slot` (e.g. poll
        * description / explanation audio). Such media is played in isolation:
@@ -1022,6 +1044,29 @@ export class AppMediaPlaybackController extends EventListenerBase<{
 
     return true;
   };
+
+  /**
+   * The tab moves to another account: the playback stops, and none of the previous account's media
+   * may answer for a message of the new one - the ids of a private chat's messages repeat across accounts.
+   */
+  public resetForAccountSwitch() {
+    this.stop(undefined, true);
+    for(const media of [...this.mediaDetails.keys()]) {
+      this.removeMedia(media);
+    }
+
+    // * it listens to the history it plays from - the previous account's
+    this.listLoader?.cleanup();
+    this.listLoader =
+      this.searchContext =
+      this.willBePlayedMedia =
+      undefined;
+
+    // * the OS media panel goes on naming the last track and its sender otherwise, its artwork pinned
+    if(navigator.mediaSession) {
+      this.setMediaMetadata(null);
+    }
+  }
 
   public playItem = (item: MediaItem) => {
     const {peerId, mid} = item;
@@ -1305,6 +1350,9 @@ export class AppMediaPlaybackController extends EventListenerBase<{
   }
 }
 
+// made once: a hot update keeps it and moves it onto the edited class (see @helpers/hotRegistry)
 const appMediaPlaybackController = new AppMediaPlaybackController();
 MOUNT_CLASS_TO.appMediaPlaybackController = appMediaPlaybackController;
 export default appMediaPlaybackController;
+
+if(import.meta.hot) import.meta.hot.accept();

@@ -2,13 +2,12 @@ import {createEffect, createRoot} from 'solid-js';
 import {render} from 'solid-js/web';
 import createCommunityAvatarElement
 from '@components/communities/communityAvatarElement';
+import {BADGE_TRANSITION_TIME} from '@components/autonomousDialogList/constants';
 import CommunityChildBadge from '@components/communities/communityChildBadge';
 import apiManagerProxy from '@lib/apiManagerProxy';
 import {i18n} from '@lib/langPack';
-import type {
-  AppDialogsManager,
-  DialogElement
-} from '@lib/appDialogsManager';
+import type {AppDialogsManager} from '@lib/appDialogsManager';
+import type {DialogElement} from '@components/dialogElement';
 import formatNumber from '@helpers/number/formatNumber';
 import getDialogMentionBadgeState from '@helpers/dialogMentionBadgeState';
 import {
@@ -30,6 +29,7 @@ export function createCommunityDialogListElement(
     dontSetActive: true,
     fromName: apiManagerProxy.getChat(communityId)?.title || '',
     isMainList: true,
+    rippleEnabled: false,
     wrapOptions: {}
   });
   const {dom} = dialogElement;
@@ -43,6 +43,9 @@ export function createCommunityDialogListElement(
     createEffect(() => {
       void dialogElement.updateTitle(community()?.title || '');
     });
+    // * the badges come in with the row's first data, and change on it after (a count rolls, as on
+    // * any row)
+    let transitionDuration = 0;
     createEffect(() => {
       const value = dialog();
       const latestDialog = value?.lastDialogs[0];
@@ -86,18 +89,28 @@ export function createCommunityDialogListElement(
       const unreadText = !unread ? undefined :
         unreadCount === 1 && unreadMarked ? '' :
         unreadMention ? '@' : formatNumber(unreadCount, 1);
+      // the muted icon follows the Community's own notify settings, exactly like a
+      // forum row follows the forum's; an unmuted Community whose unread chats are
+      // all muted only grays the badge out, the way `no-unmuted-topic` does there
+      const muted = !!value?.muted;
+      dom.listEl.classList.toggle(
+        'no-unmuted-topic',
+        !muted && unread && !value?.unreadUnmutedCount
+      );
       dialogElement.setBadgeState({
-        muted: unread && !value?.unreadUnmutedCount,
+        muted,
         pinned: !!value?.pFlags.pinned,
         unread,
         unreadText,
+        unreadCount,
         unreadMention,
         unreadAvatar: false,
         mentions: hasMentionsBadge,
         reactions: !!value?.unreadReactionsCount,
         pollVotes: !!value?.unreadPollVotesCount,
-        transitionDuration: 0
+        transitionDuration
       });
+      if(value) transitionDuration = BADGE_TRANSITION_TIME;
     });
 
     return dispose;

@@ -1,4 +1,4 @@
-import type {DialogFilter, InputChatlist, Update, Updates} from '@layer';
+import type {DialogFilter, InputChatlist, InputPeer, MessagesDialogFilters, Update, Updates} from '@layer';
 import type {Dialog} from '@appManagers/appMessagesManager';
 import type {AnyDialog} from '@lib/storages/dialogs';
 import forEachReverse from '@helpers/array/forEachReverse';
@@ -7,6 +7,7 @@ import {AppManager} from '@appManagers/manager';
 import findAndSplice from '@helpers/array/findAndSplice';
 import assumeType from '@helpers/assumeType';
 import {FOLDER_ID_ALL, FOLDER_ID_ARCHIVE, REAL_FOLDERS, REAL_FOLDER_ID, START_LOCAL_ID} from '@appManagers/constants';
+import noop from '@helpers/noop';
 import makeError from '@helpers/makeError';
 import indexOfAndSplice from '@helpers/array/indexOfAndSplice';
 import {isDialog} from '@appManagers/utils/dialogs/isDialog';
@@ -20,6 +21,8 @@ const convertment = [
 ] as ['pinned_peers' | 'exclude_peers' | 'include_peers', 'pinnedPeerIds' | 'excludePeerIds' | 'includePeerIds'][];
 
 const PREPENDED_FILTERS = REAL_FOLDERS.size;
+
+const OPTIONAL_FILTER_FIELDS = ['color', 'emoticon'] as const;
 
 const LOCAL_FILTER: DialogFilter.dialogFilter = {
   _: 'dialogFilter',
@@ -40,6 +43,21 @@ export default class FiltersStorage extends AppManager {
   private localFilters: {[filterId: string]: MyDialogFilter};
   private localId: number;
   private reloadedPeerIds: Set<PeerId>;
+  /**
+   * `messages.dialogFilters.tags_enabled`: whether the chat list shows each chat's folders under
+   * it. Kept in the state, since the folders themselves come from there and not from the server;
+   * `undefined` until the server has been asked once
+   */
+  private tagsEnabled: boolean;
+  private filtersSynced: boolean;
+  // * the folders the state keeps, put in place: what the server answers goes over them, never under
+  private stateLoaded: Promise<void>;
+  // * edits of folders on their way, and every change of what the server answers for them that has been seen - a
+  // * folder saved, an update of the folders (whether this client has the folder or not), the tags' switch set, an
+  // * edit starting or done: an answer asked for before one may carry the folders as they were, and is not taken
+  private editsInFlight = 0;
+  private changesSeen = 0;
+  private syncAfterEdits: boolean;
 
   protected after() {
     this.clear(true);
@@ -76,7 +94,8 @@ export default class FiltersStorage extends AppManager {
       this.onUpdateDialogFilters({_: 'updateDialogFilters'});
     });
 
-    return this.appStateManager.getState().then((state) => {
+    return this.stateLoaded = this.appStateManager.getState().then((state) => {
+      this.tagsEnabled = state.filtersTagsEnabled;
       const filtersArr = this.prependFilters(state.filtersArr);
       filtersArr.map((filter) => {
         this.saveDialogFilter(filter, false, true);
@@ -136,6 +155,8 @@ export default class FiltersStorage extends AppManager {
       this.filters = {};
       this.filtersArr = [];
       this.reloadedPeerIds = new Set();
+      this.tagsEnabled = undefined;
+      this.filtersSynced = false;
 
       this.localFilters = {};
       for(const filterId of REAL_FOLDERS) {
@@ -147,6 +168,8 @@ export default class FiltersStorage extends AppManager {
   };
 
   private onUpdateDialogFilter = (update: Update.updateDialogFilter) => {
+    // * the server's folders changed, a folder this client never had included
+    ++this.changesSeen;
     if(update.filter) {
       this.saveDialogFilter(update.filter as any);
     } else if(this.filters[update.id]) { // Папка удалена
@@ -161,10 +184,18 @@ export default class FiltersStorage extends AppManager {
 
   private onUpdateDialogFilters = (update: Update.updateDialogFilters) => {
     // console.warn('updateDialogFilters', update);
+    ++this.changesSeen;
+    this.reloadDialogFilters();
+  };
 
+  /**
+   * The server's folders in place of the ones kept: those it no longer has go, and its order is taken.
+   * `fetched`: its answer, when it is at hand already
+   */
+  private reloadDialogFilters(fetched?: MessagesDialogFilters) {
     const oldFilters = copy(this.filters);
 
-    this.getDialogFilters(true).then((filters) => {
+    return this.getDialogFilters(true, fetched).then((filters) => {
       for(const _filterId in oldFilters) {
         const filterId = +_filterId;
         if(!filters.find((filter) => filter.id === filterId)) { // * deleted
@@ -174,10 +205,18 @@ export default class FiltersStorage extends AppManager {
 
       this.onUpdateDialogFilterOrder({_: 'updateDialogFilterOrder', order: filters.map((filter) => filter.id)});
     });
-  };
+  }
 
   private onUpdateDialogFilterOrder = (update: Update.updateDialogFilterOrder) => {
     // console.log('updateDialogFilterOrder', update);
+    ++this.changesSeen;
+
+    // * an order naming a folder this client does not have (an updateDialogFilter missed - it has no pts) is
+    // * not this client's list any more: the folders are asked for again, as tdesktop does (applyOrder -> load)
+    if(update.order.some((filterId) => !this.filters[filterId])) {
+      this.onUpdateDialogFilters({_: 'updateDialogFilters'});
+      return;
+    }
 
     const order = update.order.slice();
     if(!order.includes(FOLDER_ID_ARCHIVE)) {
@@ -305,27 +344,85 @@ export default class FiltersStorage extends AppManager {
     }
   }
 
-  public async toggleDialogPin(peerId: PeerId, filterId: number) {
+  public toggleDialogPin(peerId: PeerId, filterId: number) {
+    const pinned = !this.filters[filterId]?.pinnedPeerIds.includes(peerId);
+    return this.toggleDialogsPin(filterId, [peerId], pinned);
+  }
+
+  /**
+   * A chat folder carries its pins itself, so changing them is an edit of the folder. Both halves
+   * are rewritten (`pinned_peers`, and the `pinnedPeerIds` the dialog indexes are generated from)
+   * and the local `filter_update` goes out before the request, so the list re-sorts without waiting
+   * for the round trip - and goes back where it was if the folder does not take the edit.
+   */
+  private setFilterPinnedPeers(filter: MyDialogFilter, peerIds: PeerId[]) {
+    const previous = filter.pinnedPeerIds.slice();
+    const inputPeers = new Map(filter.pinnedPeerIds.map((peerId, idx) => [peerId, filter.pinned_peers[idx]]));
+
+    const apply = (peerIds: PeerId[]) => {
+      // * in place: `pinnedPeerIds` is a non numerable property of the stored filter
+      filter.pinnedPeerIds.splice(0, filter.pinnedPeerIds.length, ...peerIds);
+      filter.pinned_peers.splice(
+        0,
+        filter.pinned_peers.length,
+        ...peerIds.map((peerId) => inputPeers.get(peerId) ?? this.appPeersManager.getInputPeerById(peerId))
+      );
+
+      this.rootScope.dispatchEvent('filter_update', filter);
+    };
+
+    apply(peerIds);
+
+    return this.updateDialogFilter(filter).then(noop, (err) => {
+      apply(previous);
+      throw err;
+    });
+  }
+
+  /**
+   * Reorders one chat folder's pins.
+   *
+   * `order` is the folder's pins in visual order, topmost first, and has to be exactly the set the
+   * folder holds - a reorder computed against a different set is not about this folder any more
+   * (tdesktop drops the save in that case too).
+   */
+  public reorderPinnedDialogs(filterId: number, order: PeerId[]) {
     const filter = this.filters[filterId];
-
-    const index = filter.pinnedPeerIds.indexOf(peerId);
-    const wasPinned = index !== -1;
-
-    if(wasPinned) {
-      filter.pinned_peers.splice(index, 1);
-      filter.pinnedPeerIds.splice(index, 1);
+    if(!filter) {
+      return Promise.reject(makeError('PINNED_DIALOGS_CHANGED'));
     }
 
-    if(!wasPinned) {
-      if(filter.pinned_peers.length >= (await this.apiManager.getLimit('folderPin'))) {
-        return Promise.reject(makeError('PINNED_DIALOGS_TOO_MUCH'));
-      }
-
-      filter.pinned_peers.unshift(this.appPeersManager.getInputPeerById(peerId));
-      filter.pinnedPeerIds.unshift(peerId);
+    const pinned = new Set(filter.pinnedPeerIds);
+    const reordered = order.filter((peerId) => pinned.has(peerId));
+    if(reordered.length !== pinned.size) {
+      return Promise.reject(makeError('PINNED_DIALOGS_CHANGED'));
     }
 
-    return this.updateDialogFilter(filter);
+    return this.setFilterPinnedPeers(filter, reordered);
+  }
+
+  /**
+   * Pins or unpins chats of a folder in one edit, rather than one round trip - and one full rewrite
+   * of the folder - per chat. `toggleDialogPin` is this with a single chat.
+   *
+   * `peerIds` in visual order, topmost first - new pins go above the ones the folder already has,
+   * in the order they were selected in.
+   */
+  public async toggleDialogsPin(filterId: number, peerIds: PeerId[], pinned: boolean) {
+    const filter = this.filters[filterId];
+    if(!filter) {
+      throw makeError('PINNED_DIALOGS_CHANGED');
+    }
+
+    const changing = new Set(peerIds);
+    const rest = filter.pinnedPeerIds.filter((peerId) => !changing.has(peerId));
+    const pinnedPeerIds = pinned ? [...peerIds, ...rest] : rest;
+    // the limit is about the pins the folder would end up with, so the change is whole or not at all
+    if(pinned && pinnedPeerIds.length > await this.apiManager.getLimit('folderPin')) {
+      throw makeError('PINNED_DIALOGS_TOO_MUCH');
+    }
+
+    return this.setFilterPinnedPeers(filter, pinnedPeerIds);
   }
 
   public createDialogFilter(filter: MyDialogFilter, prepend?: boolean) {
@@ -336,7 +433,7 @@ export default class FiltersStorage extends AppManager {
   }
 
   public updateDialogFilter(filter: MyDialogFilter, remove = false, prepend = false) {
-    return this.apiManager.invokeApi('messages.updateDialogFilter', {
+    return this.trackEdit(this.apiManager.invokeApi('messages.updateDialogFilter', {
       id: filter.id,
       filter: remove ? undefined : this.getOutputDialogFilter(filter)
     }).then(() => {
@@ -347,8 +444,7 @@ export default class FiltersStorage extends AppManager {
       });
 
       if(prepend) {
-        const f = Object.values(this.filters);
-        const order = f.sort((a, b) => a.localId - b.localId).map((filter) => filter.id);
+        const order = this.getOrderedFilterIds();
         indexOfAndSplice(order, filter.id);
         indexOfAndSplice(order, FOLDER_ID_ARCHIVE);
         order.splice(order[0] === FOLDER_ID_ALL ? 1 : 0, 0, filter.id);
@@ -359,28 +455,45 @@ export default class FiltersStorage extends AppManager {
       }
 
       return filter;
-    });
+    }));
   }
 
   public updateDialogFiltersOrder(order: number[]) {
-    return this.apiManager.invokeApi('messages.updateDialogFiltersOrder', {
+    return this.trackEdit(this.apiManager.invokeApi('messages.updateDialogFiltersOrder', {
       order
     }).then(() => {
       this.onUpdateDialogFilterOrder({
         _: 'updateDialogFilterOrder',
         order
       });
-    });
+    }));
   }
 
+  private trackEdit<T>(promise: Promise<T>) {
+    ++this.editsInFlight;
+    ++this.changesSeen;
+    const settle = () => {
+      ++this.changesSeen;
+      if(--this.editsInFlight || !this.syncAfterEdits) {
+        return;
+      }
+
+      this.syncAfterEdits = false;
+      this.syncWithServer().catch(this.onSyncFailed);
+    };
+
+    promise.then(settle, settle);
+    return promise;
+  }
+
+  /**
+   * The folder as the server takes it: each chat once, the pinned ones in `pinned_peers` only (as tdesktop's
+   * ChatFilter::tl), out of a copy - the folder kept here goes on including its pinned chats, which is how its
+   * chat list finds them, whether the edit is taken or not
+   */
   public getOutputDialogFilter(filter: MyDialogFilter) {
     const c = copy(filter);
-    /* convertment.forEach(([from, to]) => {
-      c[from] = c[to].map((peerId) => this.appPeersManager.getInputPeerById(peerId));
-    }); */
-
-    this.filterIncludedPinnedPeers(filter);
-
+    this.filterIncludedPinnedPeers(c);
     return c;
   }
 
@@ -472,15 +585,146 @@ export default class FiltersStorage extends AppManager {
     return reloadPromise;
   }
 
-  public async getDialogFilters(overwrite = false): Promise<MyDialogFilter[]> {
-    const keys = Object.keys(this.filters);
-    if(keys.length > PREPENDED_FILTERS && !overwrite) {
-      return keys.map((filterId) => this.filters[filterId]).sort((a, b) => a.localId - b.localId);
+  /** The kept folders, in their order */
+  private getKeptFilters() {
+    return Object.values(this.filters).sort((a, b) => a.localId - b.localId);
+  }
+
+  /** The kept folders' ids, in their order */
+  private getOrderedFilterIds() {
+    return this.getKeptFilters().map((filter) => filter.id);
+  }
+
+  public async getDialogFilters(overwrite = false, fetched?: MessagesDialogFilters): Promise<MyDialogFilter[]> {
+    if(Object.keys(this.filters).length > PREPENDED_FILTERS && !overwrite) {
+      return this.getKeptFilters();
     }
 
-    const messagesDialogFilters = await this.apiManager.invokeApiSingle('messages.getDialogFilters');
+    const messagesDialogFilters = fetched ?? await this.fetchDialogFilters();
     const prepended = this.prependFilters(messagesDialogFilters.filters);
     return prepended.map((filter) => this.saveDialogFilter(filter, overwrite)).filter(Boolean);
+  }
+
+  /**
+   * The folders the chat list starts with: `getDialogFilters()`, and the kept ones when the server refuses them (an
+   * error, the network), as tdesktop's load keeps its list - the start goes on, and the sync the chat list starts
+   * once it is up asks again. Only for the start: a list taken for the server's elsewhere could lack folders it has,
+   * and a folder made then could take the id of one of them
+   */
+  public getDialogFiltersToStart() {
+    return this.getDialogFilters().catch(() => this.getKeptFilters());
+  }
+
+  /** The folders as the server has them - and with them whether their tags are on */
+  private fetchDialogFilters() {
+    return this.apiManager.invokeApiSingle('messages.getDialogFilters').then((dialogFilters) => {
+      this.setTagsEnabled(!!dialogFilters.pFlags?.tags_enabled);
+      return dialogFilters;
+    });
+  }
+
+  /**
+   * The folders come from the state, so the server's are asked for once a session, as every other
+   * client asks on start: a folder made, changed, removed or reordered on another device while this
+   * one was closed reaches it only so - and with them whether their tags are on, which the state may
+   * have from before the switch was thrown elsewhere, or not at all. The chat list asks for it once it
+   * listens to the folders' events: what the answer changes reaches the screen only through them
+   */
+  public syncDialogFilters() {
+    if(this.filtersSynced) {
+      return;
+    }
+
+    this.filtersSynced = true;
+    this.stateLoaded.then(() => this.syncWithServer()).catch(this.onSyncFailed);
+  }
+
+  // * a sync that failed is asked for again by the next call
+  private onSyncFailed = () => {
+    this.filtersSynced = false;
+  };
+
+  /**
+   * Takes the server's folders when they are not the kept ones - a start with nothing changed elsewhere
+   * changes nothing, and tells the screen nothing. An answer that crossed an edit of a folder may have it
+   * as it was before: it is asked for again once the edits are done
+   */
+  private async syncWithServer(): Promise<void> {
+    const changesSeen = this.changesSeen;
+    const fetched = await this.apiManager.invokeApiSingle('messages.getDialogFilters');
+    if(this.editsInFlight) {
+      this.syncAfterEdits = true;
+      return;
+    }
+
+    if(this.changesSeen !== changesSeen) {
+      return this.syncWithServer();
+    }
+
+    // * taken whole, the tags' switch with the folders
+    this.setTagsEnabled(!!fetched.pFlags?.tags_enabled);
+    if(!this.isKeptAsServer(fetched.filters)) {
+      return this.reloadDialogFilters(fetched);
+    }
+  }
+
+  /** Whether the kept folders are the server's ones, in its order: what an edit would send would say the same */
+  private isKeptAsServer(serverFilters: DialogFilter[]) {
+    const keptIds = this.getOrderedFilterIds();
+    indexOfAndSplice(keptIds, FOLDER_ID_ARCHIVE);
+    const serverIds = serverFilters.map((filter) => filter._ === 'dialogFilterDefault' ? FOLDER_ID_ALL : filter.id);
+    if(!serverIds.includes(FOLDER_ID_ALL)) {
+      serverIds.unshift(FOLDER_ID_ALL);
+    }
+
+    if(keptIds.join() !== serverIds.join()) {
+      return false;
+    }
+
+    const peerIds = (peers: InputPeer[]) => (peers || []).map((peer) => this.appPeersManager.getPeerId(peer)).join();
+    const flags = (pFlags: object) => Object.keys(pFlags || {}).filter((key) => (pFlags as any)[key]).sort().join();
+    return serverFilters.every((server) => {
+      if(server._ === 'dialogFilterDefault') {
+        return true;
+      }
+
+      // * as an edit would send it: a kept folder includes its pinned chats as well
+      const kept = this.getOutputDialogFilter(this.filters[server.id]) as DialogFilter.dialogFilter;
+      return kept._ === server._ &&
+        JSON.stringify(kept.title) === JSON.stringify(server.title) &&
+        kept.emoticon === server.emoticon &&
+        kept.color === server.color &&
+        flags(kept.pFlags) === flags(server.pFlags) &&
+        kept.pinnedPeerIds.join() === peerIds(server.pinned_peers) &&
+        kept.includePeerIds.join() === peerIds(server.include_peers) &&
+        (kept.excludePeerIds || []).join() === peerIds((server as DialogFilter.dialogFilter).exclude_peers);
+    });
+  }
+
+  private setTagsEnabled(enabled: boolean) {
+    if(this.tagsEnabled === enabled) {
+      return;
+    }
+
+    ++this.changesSeen;
+    this.tagsEnabled = enabled;
+    this.appStateManager.pushToState('filtersTagsEnabled', enabled);
+  }
+
+  /**
+   * Shows or hides the folder tags in the chat list, on every device of the account. The switch
+   * is Premium's: the server takes it from a Premium account only, and the tags of an account
+   * without it stay hidden whatever the flag says (see `useFolderTagsShown`)
+   */
+  public async toggleDialogFilterTags(enabled: boolean) {
+    await this.apiManager.invokeApi('messages.toggleDialogFilterTags', {enabled});
+    this.setTagsEnabled(enabled);
+
+    // * the folders are asked for again once the tags are on, as Android does: the colours they
+    // * wear may have come with the switch
+    if(enabled) {
+      this.onUpdateDialogFilters({_: 'updateDialogFilters'});
+    }
   }
 
   public getSuggestedDialogsFilters() {
@@ -510,6 +754,14 @@ export default class FiltersStorage extends AppManager {
 
     const oldFilter = this.filters[filter.id];
     if(oldFilter) {
+      // * a flag the folder no longer has is a field the new one leaves out, and merging would keep
+      // * the old value: a colour taken off would go on tagging the folder's chats
+      for(const key of OPTIONAL_FILTER_FIELDS) {
+        if(!(key in filter)) {
+          delete (oldFilter as DialogFilter.dialogFilter)[key];
+        }
+      }
+
       filter = Object.assign(oldFilter, filter);
     } else {
       this.filters[filter.id] = filter;
@@ -518,6 +770,7 @@ export default class FiltersStorage extends AppManager {
     this.setLocalId(filter);
 
     if(!silent) {
+      ++this.changesSeen;
       if(update) {
         this.rootScope.dispatchEvent('filter_update', filter);
       } else if(!oldFilter) {

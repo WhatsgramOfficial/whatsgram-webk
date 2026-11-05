@@ -6,9 +6,8 @@ import {Middleware} from '@helpers/middleware';
 import ListenerSetter from '@helpers/listenerSetter';
 import ButtonMenu, {ButtonMenuItemOptions} from '@components/buttonMenu';
 import ButtonIcon from '@components/buttonIcon';
-import PeerTitle from '@components/peerTitle';
-import PopupElement from '@components/popups';
-import PopupReactedList from '@components/popups/reactedList';
+import ButtonMenuPeerText from '@components/buttonMenuPeerText';
+import showReactedListPopup from '@components/popups/reactedList';
 import ReactionsElement from '@components/chat/reactions';
 import ReactionElement from '@components/chat/reaction';
 import {formatFullSentTime} from '@helpers/date';
@@ -50,24 +49,6 @@ async function getReactionPack(managers: AppManagers, reaction: Reaction): Promi
     input,
     title: stickerSet.set.title
   };
-}
-
-function createPeerText(peerId: PeerId, date: number) {
-  const container = document.createElement('span');
-  container.classList.add('reaction-context-menu-peer');
-
-  const title = new PeerTitle({
-    peerId,
-    dialog: false
-  }).element;
-  title.classList.add('reaction-context-menu-peer-title');
-
-  const subtitle = document.createElement('span');
-  subtitle.classList.add('reaction-context-menu-peer-date');
-  subtitle.append(formatFullSentTime(date, false));
-
-  container.append(title, subtitle);
-  return container;
 }
 
 export default async function createReactionContextMenu({
@@ -139,7 +120,7 @@ export default async function createReactionContextMenu({
     const button: ButtonMenuItemOptions = {
       avatarInfo: {peerId},
       className: 'reaction-context-menu-participant with-subtitle',
-      textElement: createPeerText(peerId, peerReaction.date),
+      textElement: ButtonMenuPeerText(peerId, formatFullSentTime(peerReaction.date, false)),
       onClick: undefined
     };
     buttons.push(button);
@@ -152,7 +133,7 @@ export default async function createReactionContextMenu({
       text: 'ShowAllReactions',
       separator: !!buttons.length,
       onClick: () => {
-        PopupElement.createPopup(PopupReactedList, message as Message.message, reaction);
+        showReactedListPopup(message as Message.message, reaction);
       }
     });
   }
@@ -213,7 +194,6 @@ export default async function createReactionContextMenu({
 
   const element = await ButtonMenu({buttons, listenerSetter});
   element.classList.add('contextmenu', 'reaction-context-menu');
-  element.setAttribute('role', 'menu');
 
   if(resolveReactionPackButton) {
     void reactionPackPromise.then((reactionPack) => {
@@ -243,9 +223,9 @@ export default async function createReactionContextMenu({
         stack: chat.appImManager.getStackFromElement(reactionElement)
       });
     };
-    listenerSetter.add(button.element)('click', openPeer);
     button.element.tabIndex = 0;
-    button.element.setAttribute('role', 'menuitem');
+    button.element.setAttribute('role', 'button');
+    listenerSetter.add(button.element)('click', openPeer);
     listenerSetter.add(button.element)('keydown', (e: KeyboardEvent) => {
       if(e.target === button.element && (e.key === 'Enter' || e.key === ' ')) {
         openPeer(e);

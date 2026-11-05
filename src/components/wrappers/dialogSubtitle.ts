@@ -1,5 +1,6 @@
 import type {MyDraftMessage} from '@appManagers/appDraftsManager';
 import type {MyMessage} from '@appManagers/appMessagesManager';
+import type {Middleware} from '@helpers/middleware';
 import Icon from '@components/icon';
 import type {
   WrapMessageForReplyOptions
@@ -21,12 +22,15 @@ export default async function renderDialogSubtitleParts(options: {
   isSaved: boolean,
   lastMessage?: MyMessage,
   draftMessage?: MyDraftMessage,
-  highlightWord?: string,
   noForwardIcon?: boolean,
   mediaParts?: (Promise<HTMLElement> | HTMLElement)[],
+  highlightWord?: string,
   withoutMediaType?: boolean,
+  withoutMessageIcon?: boolean,
   prependPeerId?: PeerId,
   middleware: MiddlewarePromise,
+  /** the lifetime of what the parts hold, the custom emoji of the text among them */
+  wrapMiddleware?: Middleware,
   textColor: string,
   messageRenderer?: MessageRenderer,
   peerTitleRenderer?: PeerTitleRenderer
@@ -72,23 +76,33 @@ export default async function renderDialogSubtitleParts(options: {
     willPrepend.push(...options.mediaParts);
   }
 
+  // * the names the preview opens with: who wrote, then the chat they wrote in.
+  // * The arrow points from the one into the next and the last of them hands the
+  // * line over to the message with a colon — so a lone chat name keeps the
+  // * arrow (it is not someone speaking) while a lone sender keeps the colon.
+  const names: (Promise<HTMLElement> | HTMLElement)[] = [];
+  const withChatName = !!options.prependPeerId;
+  let draftLabel: HTMLElement;
+  // * a business bot writes in a private chat for its owner: it is named, as anyone writing in a group is
+  const businessBotId = lastMessage?._ === 'message' && lastMessage.via_business_bot_id;
+
   if(draftMessage) {
     const span = document.createElement('span');
     span.classList.add('danger');
     span.append(i18n('Draft'), ': ');
-    willPrepend.unshift(span);
+    // * not a name — it labels the message and stays right in front of it
+    draftLabel = span;
   } else if(
-    lastMessage &&
-    peerId.isAnyChat() &&
-    peerId !== lastMessage.fromId &&
-    lastMessage._ === 'message'
+    lastMessage?._ === 'message' &&
+    (businessBotId || (peerId.isAnyChat() && peerId !== lastMessage.fromId))
   ) {
     const span = document.createElement('span');
     span.classList.add('primary-text');
+    const senderPeerId = businessBotId ? (businessBotId as UserId).toPeerId(false) : lastMessage.fromId;
 
-    if(lastMessage.fromId === rootScope.myId) {
+    if(senderPeerId === rootScope.myId) {
       span.append(i18n('FromYou'));
-      willPrepend.unshift(span);
+      names.push(span);
     } else {
       const title = Promise.resolve(options.peerTitleRenderer)
       .then(async(wrapPeerTitle) => {
@@ -97,7 +111,7 @@ export default async function renderDialogSubtitleParts(options: {
       })
       .then((wrapPeerTitle) => {
         return middleware(wrapPeerTitle({
-          peerId: lastMessage.fromId,
+          peerId: senderPeerId,
           onlyFirstName: true
         }));
       })
@@ -106,13 +120,13 @@ export default async function renderDialogSubtitleParts(options: {
         return span;
       });
 
-      willPrepend.unshift(title);
+      names.push(title);
     }
 
-    span.append(': ');
+    if(!withChatName) span.append(': ');
   }
 
-  if(options.prependPeerId) {
+  if(withChatName) {
     const span = document.createElement('span');
     span.classList.add('primary-text');
     const title = Promise.resolve(options.peerTitleRenderer)
@@ -130,13 +144,33 @@ export default async function renderDialogSubtitleParts(options: {
       span.prepend(element);
       return span;
     });
-    span.append(': ');
-    willPrepend.unshift(title);
+    // * the arrow is a part of its own so it keeps sitting BETWEEN the names —
+    // * inside a name's own isolate an RTL title would push it to the front
+    const arrow = Icon(
+      'next',
+      'inline-icon',
+      'dialog-subtitle-arrow',
+      'primary-text'
+    );
+
+    if(names.length) {
+      names.push(arrow, title);
+      span.append(': ');
+    } else {
+      names.push(title, arrow);
+    }
   }
 
+  if(draftLabel) {
+    names.push(draftLabel);
+  }
+
+  willPrepend.unshift(...names);
+
+  // * the row's title names the sender: a transfer's line leaves the name out
   const wrapOptions: Partial<
     WrapMessageForReplyOptions & WrapRichTextOptions
-  > = {textColor};
+  > = {textColor, middleware: options.wrapMiddleware, compact: 'list'};
   let fragment: DocumentFragment;
   let wrapResult: ReturnType<typeof wrapMessageForReply>;
   if(highlightWord && lastMessage?._ === 'message' && lastMessage.message) {
@@ -144,7 +178,8 @@ export default async function renderDialogSubtitleParts(options: {
       ...wrapOptions,
       message: lastMessage,
       highlightWord,
-      withoutMediaType: options.withoutMediaType
+      withoutMediaType: options.withoutMediaType,
+      withoutMessageIcon: options.withoutMessageIcon
     });
   } else if(draftMessage) {
     wrapResult = wrapMessageForReply({
@@ -155,7 +190,8 @@ export default async function renderDialogSubtitleParts(options: {
     wrapResult = wrapMessageForReply({
       ...wrapOptions,
       message: lastMessage,
-      withoutMediaType: options.withoutMediaType
+      withoutMediaType: options.withoutMediaType,
+      withoutMessageIcon: options.withoutMessageIcon
     });
   } else {
     fragment = document.createDocumentFragment();
@@ -170,13 +206,14 @@ export default async function renderDialogSubtitleParts(options: {
 
   return [...resolvedPrepend, fragment].map((part, idx, parts) => {
     const span = document.createElement('span');
-    span.classList.add(
-      'dialog-subtitle-span',
-      'dialog-subtitle-span-overflow'
-    );
+    span.classList.add('dialog-subtitle-span');
+    // * every part isolates its own direction, so an RTL name or message reads
+    // * correctly without reordering the parts around it — that is what the
+    // * subtitle used a flex row for, at the cost of a separate ellipsis per
+    // * part; as one inline line it is elided once, at the end
+    span.dir = 'auto';
     if(idx === parts.length - 1) {
       span.classList.add('dialog-subtitle-span-last');
-      span.dir = 'auto';
     }
     span.append(part);
     return span;

@@ -9,10 +9,11 @@ import type {Chat, Dialog as MTDialog, ForumTopic as MTForumTopic, DialogPeer, M
 import type {AppMessagesManager, Dialog, ForumTopic, MyMessage, SavedDialog} from '@appManagers/appMessagesManager';
 import type {AccountDatabase} from '@config/databases/state';
 import tsNow from '@helpers/tsNow';
+import noop from '@helpers/noop';
 import SearchIndex from '@lib/searchIndex';
 import {SliceEnd} from '@helpers/slicedArray';
 import {MyDialogFilter} from '@lib/storages/filters';
-import {CAN_HIDE_TOPIC, FOLDER_ID_ALL, FOLDER_ID_ARCHIVE, NULL_PEER_ID, REAL_FOLDERS, REAL_FOLDER_ID, TEST_NO_SAVED} from '@appManagers/constants';
+import {CAN_HIDE_TOPIC, CHANNEL_CUTOFF_RETRY_LIMIT, FOLDER_ID_ALL, FOLDER_ID_ARCHIVE, NULL_PEER_ID, REAL_FOLDERS, REAL_FOLDER_ID, TEST_NO_SAVED} from '@appManagers/constants';
 import {MaybePromise, Modify, NoneToVoidFunction} from '@types';
 import ctx from '@environment/ctx';
 import AppStorage from '@lib/storage';
@@ -72,6 +73,12 @@ export type DialogUnreadState = {
   unmuted: boolean
 };
 
+export type ForumTopicsPaginationOffsets = {
+  date: number,
+  id: number,
+  topic: number
+};
+
 export const GLOBAL_FOLDER_ID: REAL_FOLDER_ID = undefined;
 
 // let spentTime = 0;
@@ -87,6 +94,8 @@ export default class DialogsStorage extends AppManager {
   private dialogsOffsetDate: {[folder_id: number]: number};
   private pinnedOrders: {[folder_id: number]: PeerId[]};
   private dialogsNum: number;
+  // * the index a dialog took among those of its date, and the top message it took it for
+  private dateIndexes: WeakMap<AnyDialog, {index: number, topMessage: number}>;
 
   private dialogsIndex: SearchIndex<PeerId>;
 
@@ -103,7 +112,13 @@ export default class DialogsStorage extends AppManager {
     deletedTopics: Set<number>,
     getTopicPromises: Map<number, CancellablePromise<ForumTopic>>,
     index: SearchIndex<ForumTopic['id']>,
-    getTopicsPromise?: Promise<any>
+    getTopicsPromise?: Promise<any>,
+    // * the topic list's pagination frontier, advanced strictly in the server's response order
+    // * (raw server ids/dates). Never derived from the locally sorted list: local order mixes in
+    // * drafts and by-id-fetched topics (e.g. every topic draft injects its topic on startup), so
+    // * the local tail can point far below the real frontier and the next page would skip
+    // * everything in between
+    paginationOffsets?: ForumTopicsPaginationOffsets
   }>;
 
   private savedDialogsPromises: Map<PeerId, Promise<SavedDialog>>;
@@ -211,14 +226,36 @@ export default class DialogsStorage extends AppManager {
       this.storage = storage;
       this.dialogs = this.storage.getCache();
 
+      // * repair orders persisted before saveDialog started cleaning the folder a pinned dialog
+      // * left: a dialog can only be pinned in the folder it lives in, and a foreign entry stays
+      // * forever, silently eating the pin limit
+      const cachedFolderIds: Map<PeerId, number> = new Map();
+      for(const dialog of dialogs) {
+        if(dialog) {
+          cachedFolderIds.set(dialog.peerId, dialog.folder_id ?? FOLDER_ID_ALL);
+        }
+      }
+
+      let hasForeignPinned = false;
       for(const folderId of REAL_FOLDERS) {
         const order = state.pinnedOrders[folderId];
         if(!order) {
           continue;
         }
 
+        const filtered = order.filter((peerId) => {
+          const cachedFolderId = cachedFolderIds.get(peerId);
+          return cachedFolderId === undefined || cachedFolderId === folderId;
+        });
+
+        hasForeignPinned ||= filtered.length !== order.length;
+
         const _order = this.getPinnedOrders(folderId);
-        _order.splice(0, _order.length, ...order);
+        _order.splice(0, _order.length, ...filtered);
+      }
+
+      if(hasForeignPinned) {
+        this.savePinnedOrders();
       }
 
       if(dialogs.length) {
@@ -337,6 +374,7 @@ export default class DialogsStorage extends AppManager {
     this.folders = {};
     this.dialogsOffsetDate = {};
     this.dialogsNum = 0;
+    this.dateIndexes = new WeakMap();
     this.dialogsIndex = this.createSearchIndex();
     this.cachedResults = {
       query: '',
@@ -366,8 +404,33 @@ export default class DialogsStorage extends AppManager {
     this.appStateManager.pushToState('pinnedOrders', this.pinnedOrders);
   }
 
+  /** A pin given (the topmost) or taken back in a folder's pin order by its key, and saved */
+  public togglePinInOrder(folderId: number, key: PeerId, pinned: boolean) {
+    const order = this.getPinnedOrders(folderId);
+    if(!order) {
+      return;
+    }
+
+    indexOfAndSplice(order, key);
+    if(pinned) {
+      order.unshift(key);
+    }
+
+    this.savePinnedOrders();
+  }
+
   public resetPinnedOrder(folderId: number) {
     this.getPinnedOrders(folderId).length = 0;
+  }
+
+  /**
+   * The pins of one list in visual order, topmost first, whichever kind of list it is - a real
+   * folder, a chat folder, a forum or the Saved Messages sublists. A chat folder carries its own
+   * pins; the real folders' local filters share the very array kept here.
+   */
+  public getPinnedOrderForFilter(filterId: number) {
+    const filter = this.filtersStorage.getFilter(filterId);
+    return ((filter ? filter.pinnedPeerIds : this.getPinnedOrders(filterId)) || []).slice();
   }
 
   public getPinnedOrders(folderId: number) {
@@ -378,6 +441,33 @@ export default class DialogsStorage extends AppManager {
     }
 
     return orders;
+  }
+
+  /**
+   * How many pins the user can actually see in the folder, which is what the pin limit is
+   * about. A member chat of a folded Community is hidden from the real folders (see
+   * AutonomousDialogList.testDialogForFilter), so its pin holds a slot that can neither be
+   * seen nor unpinned there. tdesktop drops such a history from the folder's local pinned
+   * list when the Community folds (Entry::removeFromChatList), so its limit ignores them
+   * too — the server still has the last word on the actual request.
+   */
+  public getVisiblePinnedCount(folderId: number) {
+    const orders = this.getPinnedOrders(folderId);
+    if(!REAL_FOLDERS.has(folderId)) {
+      return orders.length;
+    }
+
+    const hiddenPeerIds = new Set(
+      this.appCommunitiesManager.getCollapsedCommunityPeerIds(folderId)
+    );
+    let count = 0;
+    for(const peerId of orders) {
+      if(!hiddenPeerIds.has(peerId)) {
+        ++count;
+      }
+    }
+
+    return count;
   }
 
   public isDialogPinned(peerId: PeerId, folderId: number) {
@@ -455,8 +545,17 @@ export default class DialogsStorage extends AppManager {
     return skipMigrated ? folder.dialogs.filter((dialog) => (dialog as Dialog).migratedTo === undefined) : folder.dialogs;
   }
 
-  public getNextDialog(currentPeerId: PeerId, next: boolean, filterId: number) {
-    const folder = this.getFolderDialogs(filterId, true);
+  /**
+   * The chat next to `currentPeerId` in the folder - among `shownPeerIds` only when the list
+   * shows only some of its chats (unread ones), the current chat counted wherever it is
+   */
+  public getNextDialog(currentPeerId: PeerId, next: boolean, filterId: number, shownPeerIds?: PeerId[]) {
+    let folder = this.getFolderDialogs(filterId, true);
+    if(shownPeerIds) {
+      const shown = new Set(shownPeerIds);
+      folder = folder.filter(({peerId}) => peerId === currentPeerId || shown.has(peerId));
+    }
+
     let dialog: Folder['dialogs'][0];
     if(!currentPeerId) {
       if(next) {
@@ -636,7 +735,7 @@ export default class DialogsStorage extends AppManager {
   65536
   */
   public generateDialogIndex(date?: number, isPinned?: boolean) {
-    date ??= tsNow(true) + this.timeManager.getServerTimeOffset();
+    date ??= this.timeManager.getServerTime();
     return (date * 0x10000) + (isPinned ? 0 : (++this.dialogsNum & 0xFFFF));
   }
 
@@ -719,9 +818,16 @@ export default class DialogsStorage extends AppManager {
       this.prepareFolderUnreadCountModifyingByDialog(folderId, dialog, !!newDialogIndex);
     }
 
+    // * a virtual folder's count is the server's total (set from paged responses and the count
+    // * peek in `getForumTopicById`) — it already includes entries that were never loaded
+    // * locally, so local membership changes must not touch it: every topic arriving from a page
+    // * or a by-id fetch would be counted twice, inflating the list's virtual size. Once the
+    // * folder is fully loaded, consumers use its length instead
+    const adjustCount = folder.count !== null && !this.isVirtualFilter(folderId);
+
     if(wasIndex !== -1) {
       dialogs.splice(wasIndex, 1);
-      if(folder.count !== null) {
+      if(adjustCount) {
         --folder.count;
       }
     }
@@ -729,7 +835,7 @@ export default class DialogsStorage extends AppManager {
     if(newDialogIndex) {
       insertInDescendSortedArray(dialogs, dialog, (dialog) => this.getDialogIndex(dialog, indexKey), -1);
 
-      if(wasIndex === -1 && folder.count !== null) {
+      if(wasIndex === -1 && adjustCount) {
         ++folder.count;
       }
     }
@@ -783,7 +889,8 @@ export default class DialogsStorage extends AppManager {
         !!(toggle && wasUnreadCount),
         !!(toggle && wasUnreadCount && wasUnmuted),
         !!(toggle && wasUnreadMentionsCount),
-        dialog
+        dialog,
+        !toggle
       );
       return;
     }
@@ -811,12 +918,21 @@ export default class DialogsStorage extends AppManager {
     toggleDialog: boolean,
     toggleUnmuted: boolean,
     toggleMentions: boolean,
-    dialog: Dialog | ForumTopic
+    dialog: Dialog | ForumTopic,
+    removing?: boolean
   ) {
     const {peerId} = dialog;
     const isForum = this.appPeersManager.isForum(peerId);
     const isTopic = isForumTopic(dialog);
-    if(isForum && !isTopic && !(dialog as Dialog).pFlags.view_forum_as_messages) {
+    // * a forum's unread state lives in its topics, not in its dialog
+    const isForumAggregate = isForum && !isTopic && !(dialog as Dialog).pFlags.view_forum_as_messages;
+    if(isForumAggregate && removing) {
+      // * the forum is leaving this folder (deleted, left, archived) — its topics are still cached
+      // * and still unread, so recomputing the aggregate here would re-add the very peer that's
+      // * being removed. No messages were ever counted for a forum either, hence the zero.
+      addMessagesCount = 0;
+      toggleDialog = toggleUnmuted = toggleMentions = false;
+    } else if(isForumAggregate) {
       const forumUnreadCount = this.getForumUnreadCount(peerId);
       if(forumUnreadCount instanceof Promise) {
         forumUnreadCount.then(({count, hasUnmuted}) => {
@@ -924,7 +1040,18 @@ export default class DialogsStorage extends AppManager {
 
     topDate ||= tsNow(true);
 
+    // * dialogs of one date stand in the order they took their indexes in, as in tdesktop: only a new date or
+    // * top message takes a new one - a re-run for a read or a mute must not lift a dialog over its neighbours
+    const was = !isPinned && this.dateIndexes.get(dialog);
+    if(was && was.topMessage === dialog.top_message && Math.floor(was.index / 0x10000) === topDate) {
+      return was.index;
+    }
+
     const index = this.generateDialogIndex(topDate, isPinned);
+    if(!isPinned) {
+      this.dateIndexes.set(dialog, {index, topMessage: dialog.top_message});
+    }
+
     if(justReturn) {
       return index;
     }
@@ -1118,7 +1245,10 @@ export default class DialogsStorage extends AppManager {
     this.processDialogForFilters(dialog);
     // }
 
-    if(offsetDate && !dialog.pFlags.pinned) {
+    // ! a topic's offset date would come from the FORUM's history (topics have no history of their
+    // ! own here), which has nothing to do with the topic list's own ordering — forum topics are
+    // ! paginated by the last topic's offsets instead, so no global offset date is kept for them
+    if(offsetDate && !dialog.pFlags.pinned && !isForumTopic(dialog)) {
       if(_isDialog && saveGlobalOffset) {
         const savedGlobalOffsetDate = this.dialogsOffsetDate[GLOBAL_FOLDER_ID];
         if(!savedGlobalOffsetDate || offsetDate < savedGlobalOffsetDate) {
@@ -1235,13 +1365,7 @@ export default class DialogsStorage extends AppManager {
       const mid = historyStorage?.channelJoinedMid;
       if(mid) {
         historyStorage.channelJoinedMid = undefined;
-        this.apiUpdatesManager.processLocalUpdate({
-          _: 'updateDeleteChannelMessages',
-          channel_id: peerId.toChatId(),
-          messages: [mid],
-          pts: undefined,
-          pts_count: undefined
-        });
+        this.appMessagesManager.processLocalDeleteMessages(peerId, [mid]);
       }
     }
 
@@ -1250,7 +1374,11 @@ export default class DialogsStorage extends AppManager {
 
   public applyDialogs(
     result: MessagesPeerDialogs | MessagesForumTopics | ({_: 'messages.savedDialogs', dialogs: SavedDialog[]} & Parameters<AppMessagesManager['saveApiResult']>[0]),
-    peerId?: PeerId
+    peerId?: PeerId,
+    // * the notification settings clock's tick the result was asked for at (appNotificationsManager.getSettingsClock)
+    settingsAskedAt?: number,
+    // * the drafts clock's tick the result was asked for at (appDraftsManager.getDraftsClock)
+    draftsAskedAt?: number
   ) {
     // * В эту функцию попадут только те диалоги, в которых есть read_inbox_max_id и read_outbox_max_id, в отличие от тех, что будут в getTopMessages
 
@@ -1261,7 +1389,7 @@ export default class DialogsStorage extends AppManager {
     if(isForum) {
       this.processTopics(peerId, result);
     } else if(isDialog) {
-      this.filterDialogsForStorage(result.dialogs);
+      this.filterDialogsForStorage(result.dialogs, undefined, settingsAskedAt);
     }
 
     this.appMessagesManager.saveApiResult(result);
@@ -1309,7 +1437,7 @@ export default class DialogsStorage extends AppManager {
       }
 
       if(topMid || (dialog as Dialog | ForumTopic).draft?._ === 'draftMessage') {
-        if(this.saveDialog({dialog})) {
+        if(this.saveDialog({dialog, keepPlace: true, settingsAskedAt, draftsAskedAt})) {
           const cache = getUpdateCache(peerId);
 
           if(isForum) {
@@ -1352,7 +1480,8 @@ export default class DialogsStorage extends AppManager {
 
   public filterDialogsForStorage(
     dialogs: MTDialog[],
-    onPinnedOrder?: (order: PeerId[]) => void
+    onPinnedOrder?: (order: PeerId[]) => void,
+    settingsAskedAt?: number
   ): MTDialog.dialog[] {
     if(onPinnedOrder) {
       onPinnedOrder(dialogs.flatMap((dialog) => {
@@ -1372,7 +1501,7 @@ export default class DialogsStorage extends AppManager {
     // guarantee their relative order, while callers iterate the remaining dialogs in reverse.
     forEachReverse(dialogs, (dialog, idx, arr) => {
       if(dialog._ === 'dialogCommunity') {
-        this.saveDialog({dialog});
+        this.saveDialog({dialog, settingsAskedAt});
         arr.splice(idx, 1);
       } else if(dialog._ === 'dialogFolder') {
         // ! fix 'dialogFolder', maybe there is better way to do it, this only can happen by 'messages.getPinnedDialogs' by folder_id: 0
@@ -1444,24 +1573,49 @@ export default class DialogsStorage extends AppManager {
   }
 
   /**
+   * A dialog's notification settings go to appNotificationsManager, unless they are older than what changed there
+   * since the dialog was asked for (`settingsAskedAt`): then the dialog carries what is kept instead
+   */
+  private saveDialogNotifySettings(
+    dialog: AnyDialog | MTDialog.dialogCommunity,
+    target: {peerId?: PeerId, threadId?: number, communityId?: ChatId},
+    settingsAskedAt: number
+  ) {
+    const dialogWithSettings = dialog as MTDialog.dialog;
+    const kept = this.appNotificationsManager.savePeerSettings({
+      ...target,
+      settings: dialogWithSettings.notify_settings,
+      askedAt: settingsAskedAt
+    });
+    if(kept && kept !== dialogWithSettings.notify_settings) {
+      dialogWithSettings.notify_settings = kept;
+    }
+  }
+
+  /**
    * Won't save migrated from peer, forbidden peers, left and kicked
    */
   public saveDialog({
     dialog,
-    folderId,
     ignoreOffsetDate,
-    saveGlobalOffset
+    saveGlobalOffset,
+    keepPlace,
+    settingsAskedAt,
+    draftsAskedAt
   }: {
     dialog: AnyDialog | MTDialog.dialogCommunity,
-    folderId?: REAL_FOLDER_ID,
     ignoreOffsetDate?: boolean,
-    saveGlobalOffset?: boolean
+    saveGlobalOffset?: boolean,
+    // * a dialog refreshed on its own keeps its place among those of its date; a page of the list takes the
+    // * server's order instead
+    keepPlace?: boolean,
+    // * the notification settings clock's tick the dialog was asked for at (appNotificationsManager.getSettingsClock)
+    settingsAskedAt?: number,
+    // * the drafts clock's tick the dialog was asked for at (appDraftsManager.getDraftsClock)
+    draftsAskedAt?: number
   }) {
     if(dialog._ === 'dialogCommunity') {
-      this.appNotificationsManager.savePeerSettings({
-        communityId: dialog.community_id,
-        settings: dialog.notify_settings
-      });
+      this.saveDialogNotifySettings(dialog, {communityId: dialog.community_id}, settingsAskedAt);
       this.appCommunitiesManager?.saveCommunityDialog(dialog);
       return false;
     }
@@ -1477,9 +1631,9 @@ export default class DialogsStorage extends AppManager {
     const topicId = isTopic ?
       dialog.id = this.appMessagesIdsManager.generateMessageId(dialog.id, channelId) :
       (isSaved ? savedPeerId : undefined);
-    if(_isDialog) {
-      folderId ??= dialog.folder_id ?? FOLDER_ID_ALL;
-    }
+    // * the server stamps 'folder_id' on every dialog that lives outside the main folder, in
+    // * folder-scoped answers too, so its absence always means the main folder
+    const folderId: REAL_FOLDER_ID = _isDialog ? (dialog.folder_id ?? FOLDER_ID_ALL) : undefined;
 
     if(!peerId) {
       this.log.error('saveConversation no peerId???', dialog, folderId);
@@ -1510,6 +1664,10 @@ export default class DialogsStorage extends AppManager {
     }
 
     const wasDialogBefore = this.getAnyDialog(peerId, topicId);
+    const wasDateIndex = keepPlace && wasDialogBefore && this.dateIndexes.get(wasDialogBefore);
+    if(wasDateIndex) {
+      this.dateIndexes.set(dialog, wasDateIndex);
+    }
 
     let mid: number, message: MyMessage;
     if(dialog.top_message || true) {
@@ -1585,18 +1743,30 @@ export default class DialogsStorage extends AppManager {
 
     if(_isDialog && dialog.folder_id === undefined) {
       if(dialog._ === 'dialog') {
-        // ! СЛОЖНО ! СМОТРИ В getTopMessages
-        dialog.folder_id = wasDialogBefore ? (wasDialogBefore as typeof dialog).folder_id : folderId;
+        dialog.folder_id = folderId;
       }/*  else if(dialog._ === 'dialogFolder') {
         dialog.folder_id = dialog.folder.id;
       } */
+    }
+
+    // * a dialog can only be pinned in the folder it lives in. When the move is learned from a
+    // * dialogs answer instead of 'updateFolderPeers' (offline while it happened, another device),
+    // * nothing drops the peer from the old folder's order — and the order is persisted, so the
+    // * dead entry silently eats a slot of that folder's pin limit forever
+    if(_isDialog && wasDialogBefore) {
+      const wasFolderId = (wasDialogBefore as typeof dialog).folder_id ?? FOLDER_ID_ALL;
+      if(wasFolderId !== folderId && indexOfAndSplice(this.getPinnedOrders(wasFolderId), peerId) !== undefined) {
+        this.savePinnedOrders();
+      }
     }
 
     if(!isSaved) {
       dialog.draft = this.appDraftsManager.saveDraft({
         peerId,
         threadId: topicId,
-        draft: dialog.draft
+        draft: dialog.draft,
+        cloud: true,
+        askedAt: draftsAskedAt
       });
     } else {
       dialog.savedPeerId = savedPeerId;
@@ -1648,11 +1818,7 @@ export default class DialogsStorage extends AppManager {
       historyStorage.readMaxId = dialog.read_inbox_max_id;
       historyStorage.readOutboxMaxId = dialog.read_outbox_max_id;
 
-      this.appNotificationsManager.savePeerSettings({
-        peerId,
-        threadId: isTopic ? dialog.id : undefined,
-        settings: dialog.notify_settings
-      });
+      this.saveDialogNotifySettings(dialog, {peerId, threadId: isTopic ? dialog.id : undefined}, settingsAskedAt);
     }
 
     if(_isDialog && channelId && dialog.pts) {
@@ -1700,6 +1866,50 @@ export default class DialogsStorage extends AppManager {
     }
   }
 
+  /**
+   * A custom folder is tested against contacts and holds peers that may still be missing - both
+   * have to be there before its dialogs are read
+   */
+  private prepareFolderForFilter(filterId: number) {
+    if(this.isVirtualFilter(filterId) || REAL_FOLDERS.has(filterId)) {
+      return;
+    }
+
+    const promises: Promise<any>[] = [];
+
+    const fillContactsResult = this.appUsersManager.fillContacts();
+    if(!fillContactsResult.cached) {
+      promises.push(fillContactsResult.promise);
+    }
+
+    const reloadMissingDialogsPromise = this.filtersStorage.reloadMissingPeerIds(filterId);
+    if(reloadMissingDialogsPromise) {
+      promises.push(reloadMissingDialogsPromise);
+    }
+
+    return promises.length ? Promise.all(promises) : undefined;
+  }
+
+  /**
+   * Where the page below `offsetIndex` starts in dialogs sorted by `indexKey`
+   */
+  private getOffsetByIndex(
+    dialogs: Folder['dialogs'],
+    offsetIndex: number,
+    indexKey: ReturnType<typeof getDialogIndexKey>
+  ) {
+    let offset = 0;
+    if(offsetIndex > 0) {
+      for(const length = dialogs.length; offset < length; ++offset) {
+        if(offsetIndex > this.getDialogIndex(dialogs[offset], indexKey)) {
+          break;
+        }
+      }
+    }
+
+    return offset;
+  }
+
   public getDialogs(options: {
     query?: string,
     offsetIndex?: number,
@@ -1729,24 +1939,11 @@ export default class DialogsStorage extends AppManager {
     const isForum = this.isFilterIdForForum(filterId);
     const isBotforum = this.appPeersManager.isBotforum(filterId);
     const isVirtualFilter = this.isVirtualFilter(filterId);
-    if(!isVirtualFilter && !REAL_FOLDERS.has(filterId)) {
-      const promises: Promise<any>[] = [];
-
-      const fillContactsResult = this.appUsersManager.fillContacts();
-      if(!fillContactsResult.cached) {
-        promises.push(fillContactsResult.promise);
-      }
-
-      const reloadMissingDialogsPromise = this.filtersStorage.reloadMissingPeerIds(filterId);
-      if(reloadMissingDialogsPromise) {
-        promises.push(reloadMissingDialogsPromise);
-      }
-
-      if(promises.length) {
-        return Promise.all(promises).then(() => {
-          return this.getDialogs(options);
-        });
-      }
+    const preparePromise = this.prepareFolderForFilter(filterId);
+    if(preparePromise) {
+      return preparePromise.then(() => {
+        return this.getDialogs(options);
+      });
     }
 
     // let's load only first pages by certain folderId. next pages will load without folder filtering
@@ -1795,14 +1992,7 @@ export default class DialogsStorage extends AppManager {
       this.cachedResults.query = '';
     }
 
-    let offset = 0;
-    if(offsetIndex > 0) {
-      for(const length = curDialogStorage.length; offset < length; ++offset) {
-        if(offsetIndex > this.getDialogIndex(curDialogStorage[offset], indexKey)) {
-          break;
-        }
-      }
-    }
+    let offset = this.getOffsetByIndex(curDialogStorage, offsetIndex, indexKey);
 
     const loadedAll = this.isDialogsLoaded(realFolderId);
     const isEnoughDialogs = curDialogStorage.length >= (offset + limit);
@@ -1820,8 +2010,10 @@ export default class DialogsStorage extends AppManager {
       limit,
       folderId: realFolderId,
       query,
-      offsetTopicId: isForum && query ? (curDialogStorage[curDialogStorage.length - 1] as ForumTopic)?.id : undefined,
-      offsetBotforumTopic: isBotforum ? (curDialogStorage[curDialogStorage.length - 1] as ForumTopic) : undefined,
+      // ! only server search pages by the local results' tail — the regular topic list is paged by
+      // ! the stored pagination offsets (see `updateForumTopicsPaginationOffsets`), because the
+      // ! locally sorted list is poisoned by drafts and by-id-fetched topics
+      offsetTopic: (isForum || isBotforum) && query ? curDialogStorage[curDialogStorage.length - 1] as ForumTopic : undefined,
       excludeCommunityDialogs: filterType === FilterType.Folder && filterId === FOLDER_ID_ALL
     }).then((result) => {
       if(query) {
@@ -1839,14 +2031,7 @@ export default class DialogsStorage extends AppManager {
         curDialogStorage = this.getFolderDialogs(filterId, skipMigrated);
       }
 
-      offset = 0;
-      if(offsetIndex > 0) {
-        for(const length = curDialogStorage.length; offset < length; ++offset) {
-          if(offsetIndex > this.getDialogIndex(curDialogStorage[offset], indexKey)) {
-            break;
-          }
-        }
-      }
+      offset = this.getOffsetByIndex(curDialogStorage, offsetIndex, indexKey);
 
       // this.log.warn(offset, offset + limit, curDialogStorage.dialogs.length, this.dialogs.length);
 
@@ -1859,6 +2044,76 @@ export default class DialogsStorage extends AppManager {
         isEnd: result.isEnd && curDialogStorage[curDialogStorage.length - 1] === dialogs[dialogs.length - 1]
       };
     });
+  }
+
+  /**
+   * The chats of a real folder whose titles match `query`. Only the loaded part of a folder is
+   * indexed, so until it is loaded in full the server's own matches are taken too, once their
+   * dialogs tell which folder they are in.
+   */
+  public async searchFolderDialogs(query: string, folderId: REAL_FOLDER_ID, limit = 20): Promise<PeerId[]> {
+    const loadedAll = this.isDialogsLoaded(folderId);
+    const [{dialogs}, serverPeerIds] = await Promise.all([
+      this.getDialogs({query, filterId: folderId, limit}),
+      loadedAll ? [] as PeerId[] : this.appUsersManager.searchContacts(query, limit).then(
+        ({my_results}) => my_results,
+        () => [] as PeerId[]
+      )
+    ]);
+
+    const peerIds = new Set(dialogs.map((dialog) => dialog.peerId));
+    // * a dialog older than the loaded part of its folder is not kept, so its folder is read off the answer
+    const serverDialogs = await Promise.all(serverPeerIds.map((peerId) => {
+      return this.getDialogOnly(peerId) ?? this.appMessagesManager.reloadConversation(peerId).catch(noop);
+    }));
+
+    for(const dialog of serverDialogs) {
+      if(dialog && (dialog.folder_id ?? FOLDER_ID_ALL) === folderId) {
+        peerIds.add(dialog.peerId);
+      }
+    }
+
+    return [...peerIds].slice(0, limit);
+  }
+
+  /**
+   * A page of the folder's unread dialogs - the ones its unread counter counts, so a forum is
+   * unread by its topics and a chat marked as unread is too - and of `keepPeerIds`, the ones a
+   * list keeps since it was built although they are read now. Unread dialogs can be anywhere in
+   * the folder, so it waits for every dialog to be loaded; `unreadPeerIds` is the whole folder's.
+   */
+  public async getUnreadDialogs({
+    filterId,
+    offsetIndex,
+    limit = 20,
+    skipMigrated = true,
+    keepPeerIds
+  }: {
+    filterId: number,
+    offsetIndex?: number,
+    limit?: number,
+    skipMigrated?: boolean,
+    keepPeerIds?: PeerId[]
+  }) {
+    await Promise.all([
+      this.prepareFolderForFilter(filterId),
+      this.appMessagesManager.fillConversations()
+    ]);
+
+    const {unreadPeerIds} = this.getFolder(filterId);
+    const kept = new Set(keepPeerIds);
+    const unreadDialogs = this.getFolderDialogs(filterId, skipMigrated).filter((dialog) => {
+      const key = getDialogKey(dialog);
+      return unreadPeerIds.has(key) || kept.has(key);
+    });
+
+    const offset = this.getOffsetByIndex(unreadDialogs, offsetIndex, this.getDialogIndexKeyByFilterId(filterId));
+    return {
+      dialogs: unreadDialogs.slice(offset, offset + limit),
+      count: unreadDialogs.length,
+      isEnd: offset + limit >= unreadDialogs.length,
+      unreadPeerIds: [...unreadPeerIds]
+    };
   }
 
   public async markFolderAsRead(
@@ -1899,9 +2154,35 @@ export default class DialogsStorage extends AppManager {
 
     cache.topics.clear();
     cache.temporaryTopics.clear();
+    delete cache.paginationOffsets;
 
     // for permanent delete
     // this.forumTopics.delete(peerId);
+  }
+
+  public getForumTopicsPaginationOffsets(peerId: PeerId): ForumTopicsPaginationOffsets {
+    return this.getForumTopicsCache(peerId).paginationOffsets ??= {date: 0, id: 0, topic: 0};
+  }
+
+  /**
+   * Advance the topic list's pagination frontier from a `messages.getForumTopics` page, walking
+   * the topics in the server's response order — mirrors tdesktop's
+   * `Data::Forum::applyReceivedTopics`. Only a SERVER top message can anchor the date/id offsets
+   * (`saveDialog` may have swapped `top_message` to a local pending outgoing mid); a topic
+   * without one advances only the topic offset, keeping the previous date/id.
+   */
+  public updateForumTopicsPaginationOffsets(peerId: PeerId, topics: ForumTopic[]) {
+    const offsets = this.getForumTopicsPaginationOffsets(peerId);
+    const messagesStorage = this.appMessagesManager.getHistoryMessagesStorage(peerId);
+    topics.forEach((topic) => {
+      const message = this.appMessagesManager.getMessageFromStorage(messagesStorage, topic.top_message);
+      if(message && !message.pFlags.is_outgoing) {
+        offsets.date = (message as Message.message).date;
+        offsets.id = getServerMessageId(topic.top_message);
+      }
+
+      offsets.topic = getServerMessageId(topic.id);
+    });
   }
 
   public getForumTopicsCache(peerId: PeerId) {
@@ -1919,6 +2200,10 @@ export default class DialogsStorage extends AppManager {
     }
 
     return forumTopics;
+  }
+
+  public getForumTopicsCacheIfExists(peerId: PeerId) {
+    return this.forumTopics.get(peerId);
   }
 
   public getForumTopicById(peerId: PeerId, topicId?: number): Promise<ForumTopic> {
@@ -1975,47 +2260,70 @@ export default class DialogsStorage extends AppManager {
 
       const topicsFolder = this.getFolder(peerId);
 
-      return Promise.all([
-        this.apiManager.invokeApi('messages.getForumTopicsByID', {
-          peer: this.appPeersManager.getInputPeerById(peerId),
-          topics: ids
-        }),
-        topicsFolder.count === null && this.apiManager.invokeApi('messages.getForumTopics', {
-          peer: this.appPeersManager.getInputPeerById(peerId),
-          offset_date: 0,
-          offset_id: 0,
-          limit: 1,
-          offset_topic: 0
-        })
-      ]).then(([messagesForumTopics, allMessagesForumTopicsResult]) => {
-        if(this.getForumTopicsCache(peerId) !== cache) {
-          resolveLeft(() => false);
+      const request = async() => {
+        for(let attempt = 0; ; ++attempt) {
+          const cutoffGeneration = this.appMessagesManager.getChannelAvailableMinIdGeneration(peerId);
+          const cutoffChanged = () => attempt < CHANNEL_CUTOFF_RETRY_LIMIT &&
+            cutoffGeneration !== this.appMessagesManager.getChannelAvailableMinIdGeneration(peerId);
+          const settingsAskedAt = this.appNotificationsManager.getSettingsClock();
+          const draftsAskedAt = this.appDraftsManager.getDraftsClock();
+          const result = await Promise.all([
+            this.apiManager.invokeApi('messages.getForumTopicsByID', {
+              peer: this.appPeersManager.getInputPeerById(peerId),
+              topics: ids
+            }),
+            topicsFolder.count === null && this.apiManager.invokeApi('messages.getForumTopics', {
+              peer: this.appPeersManager.getInputPeerById(peerId),
+              offset_date: 0,
+              offset_id: 0,
+              limit: 1,
+              offset_topic: 0
+            })
+          ]);
+          if(this.getForumTopicsCache(peerId) !== cache) {
+            resolveLeft(() => false);
+            return;
+          }
+          if(cutoffChanged()) {
+            continue;
+          }
+
+          const [messagesForumTopics, allMessagesForumTopicsResult] = result;
+          if(this.getForumTopicsCache(peerId) !== cache) {
+            resolveLeft(() => false);
+            return;
+          }
+          if(cutoffChanged()) {
+            continue;
+          }
+
+          // capture the topics the server EXPLICITLY reported as deleted before applyDialogs filters
+          // `forumTopicDeleted` out (ids here are raw server ids)
+          const deletedServerIds = new Set<number>(
+            (messagesForumTopics.topics || [])
+            .filter((topic) => topic._ === 'forumTopicDeleted')
+            .map((topic) => topic.id)
+          );
+
+          this.applyDialogs(messagesForumTopics, peerId, settingsAskedAt, draftsAskedAt);
+
+          if(typeof allMessagesForumTopicsResult?.count === 'number') {
+            topicsFolder.count = allMessagesForumTopicsResult.count;
+          }
+
+          messagesForumTopics.topics.forEach((forumTopic) => {
+            if(isForumTopic(forumTopic as ForumTopic)) {
+              promises[forumTopic.id]?.resolve(forumTopic as ForumTopic);
+              delete promises[forumTopic.id];
+            }
+          });
+
+          resolveLeft((encodedTopicId) => deletedServerIds.has(getServerMessageId(encodedTopicId)));
           return;
         }
+      };
 
-        // capture the topics the server EXPLICITLY reported as deleted before applyDialogs filters
-        // `forumTopicDeleted` out (ids here are raw server ids)
-        const deletedServerIds = new Set<number>(
-          (messagesForumTopics.topics || [])
-          .filter((topic) => topic._ === 'forumTopicDeleted')
-          .map((topic) => topic.id)
-        );
-
-        this.applyDialogs(messagesForumTopics, peerId);
-
-        if(typeof allMessagesForumTopicsResult?.count === 'number') {
-          topicsFolder.count = allMessagesForumTopicsResult.count;
-        }
-
-        messagesForumTopics.topics.forEach((forumTopic) => {
-          if(isForumTopic(forumTopic as ForumTopic)) {
-            promises[forumTopic.id]?.resolve(forumTopic as ForumTopic);
-            delete promises[forumTopic.id];
-          }
-        });
-
-        resolveLeft((encodedTopicId) => deletedServerIds.has(getServerMessageId(encodedTopicId)));
-      }, (error) => {
+      return request().catch((error) => {
         this.log.error('getForumTopicsByID failed, not marking topics deleted', peerId, ids, error);
         resolveLeft(() => false);
       }).then(() => {
@@ -2132,6 +2440,16 @@ export default class DialogsStorage extends AppManager {
     return ((this.appChatsManager.getChat(chatId) as Chat.channel).admin_rights ? this.appChatsManager.hasRights(forumTopic.peerId.toChatId(), 'manage_topics') : false);
   }
 
+  /**
+   * Whether the reopen action should be offered for a closed topic — mirrors
+   * tdesktop's `TopicReopenBar` state. Composite so the UI needs one round-trip
+   * instead of fetching the topic and asking about rights separately.
+   */
+  public canReopenTopic(peerId: PeerId, threadId: number) {
+    const forumTopic = this.getForumTopic(peerId, threadId);
+    return !!forumTopic?.pFlags?.closed && this.canManageTopic(forumTopic);
+  }
+
   // * FORUMS SECTION END
 
   // * SAVED SECTION
@@ -2191,7 +2509,12 @@ export default class DialogsStorage extends AppManager {
 
   // * SAVED SECTION END
 
-  private handleDialogTogglePinned(dialog: AnyDialog, pinned: boolean, folderId: number) {
+  /**
+   * `peerId`: whose dialog it is, and `savedPeerId` which of Saved Messages' - also without it at hand: one
+   * pinned elsewhere that is not loaded here is asked for (handleNewDialogs reloads it), as handleDialogsPinned
+   * does with a pin order
+   */
+  private handleDialogTogglePinned(dialog: AnyDialog, pinned: boolean, folderId: number, peerId: PeerId, savedPeerId?: PeerId) {
     if(dialog) {
       if(!pinned) {
         this.handleDialogUnpinning(dialog, folderId);
@@ -2202,7 +2525,7 @@ export default class DialogsStorage extends AppManager {
       this.generateIndexForDialog(dialog);
     }
 
-    this.appMessagesManager.scheduleHandleNewDialogs(dialog.peerId, dialog);
+    this.appMessagesManager.scheduleHandleNewDialogs(peerId, dialog ?? savedPeerId);
   }
 
   public handleDialogsPinned(folderId: number, order: (Dialog['peerId'] | ForumTopic['id'] | SavedDialog['savedPeerId'])[]) {
@@ -2249,6 +2572,9 @@ export default class DialogsStorage extends AppManager {
         this.appMessagesManager.scheduleHandleNewDialogs(dialog.peerId, dialog);
       }
     }
+
+    // the Community rows of the main list take their places from its pins
+    this.appCommunitiesManager.handlePinnedDialogsOrder(folderId as REAL_FOLDER_ID);
   }
 
   // only 0 and 1 folders
@@ -2263,7 +2589,8 @@ export default class DialogsStorage extends AppManager {
       const dialog = this.dropDialogFromFolders(peerId, undefined, true)[0] as Dialog;
       if(dialog) {
         if(dialog.pFlags?.pinned) {
-          this.handleDialogUnpinning(dialog, folder_id);
+          // * the pin belongs to the folder the dialog is LEAVING, not to the one it moves to
+          this.handleDialogUnpinning(dialog, dialog.folder_id ?? FOLDER_ID_ALL);
         }
 
         (dialog as Dialog).folder_id = folder_id as REAL_FOLDER_ID;
@@ -2310,7 +2637,19 @@ export default class DialogsStorage extends AppManager {
       }
     } */
 
-    this.handleDialogTogglePinned(dialog, update.pFlags.pinned, folderId);
+    const isSaved = update._ === 'updateSavedDialogPinned';
+    // * the pin order takes the pin at once, in the order the pins come: a dialog takes its place from it only
+    // * when it is indexed later (handleNewDialogs) or asked for (one not loaded; getSavedDialogById rebuilds a
+    // * Saved Messages subdialog's pin from it), and pins of one batch must not swap places meanwhile
+    this.togglePinInOrder(folderId, peerId, !!update.pFlags.pinned);
+
+    this.handleDialogTogglePinned(
+      dialog,
+      update.pFlags.pinned,
+      folderId,
+      isSaved ? this.appPeersManager.peerId : peerId,
+      isSaved ? peerId : undefined
+    );
   };
 
   private onUpdatePinnedForumTopic = (update: Update.updatePinnedForumTopic) => {
@@ -2322,7 +2661,7 @@ export default class DialogsStorage extends AppManager {
       return;
     }
 
-    this.handleDialogTogglePinned(topic, update.pFlags.pinned, this.getFilterIdForForum(topic));
+    this.handleDialogTogglePinned(topic, update.pFlags.pinned, this.getFilterIdForForum(topic), peerId);
   };
 
   private onUpdatePinnedDialogs = (update: Update.updatePinnedDialogs | Update.updatePinnedSavedDialogs) => {
@@ -2345,22 +2684,47 @@ export default class DialogsStorage extends AppManager {
         return [];
       });
       this.handleDialogsPinned(folderId, order);
-      this.appCommunitiesManager.handlePinnedDialogsOrder(folderId as REAL_FOLDER_ID);
     } else {
       type S = Modify<MessagesSavedDialogs.messagesSavedDialogs, {dialogs: Array<SavedDialog>}>;
-      let promise: Promise<MessagesPeerDialogs | S>;
+      let promise: Promise<{
+        result: MessagesPeerDialogs | S,
+        cutoffGeneration?: string | number,
+        settingsAskedAt?: number,
+        draftsAskedAt?: number
+      }>;
       if(isSaved) {
-        promise = this.apiManager.invokeApi('messages.getPinnedSavedDialogs') as Promise<S>;
+        promise = (this.apiManager.invokeApi('messages.getPinnedSavedDialogs') as Promise<S>)
+        .then((result) => ({result}));
       } else {
-        promise = this.apiManager.invokeApi('messages.getPinnedDialogs', {
-          folder_id: folderId
-        });
+        promise = (async() => {
+          for(let attempt = 0; ; ++attempt) {
+            const cutoffGeneration = this.appMessagesManager.getChannelAvailableMinIdGeneration();
+            const settingsAskedAt = this.appNotificationsManager.getSettingsClock();
+            const draftsAskedAt = this.appDraftsManager.getDraftsClock();
+            const result = await this.apiManager.invokeApi('messages.getPinnedDialogs', {
+              folder_id: folderId
+            });
+            if(
+              cutoffGeneration === this.appMessagesManager.getChannelAvailableMinIdGeneration() ||
+              attempt >= CHANNEL_CUTOFF_RETRY_LIMIT
+            ) {
+              return {result, cutoffGeneration, settingsAskedAt, draftsAskedAt};
+            }
+          }
+        })();
       }
 
       const communityPinStateTokens = isSaved ?
         undefined :
         this.appCommunitiesManager.captureCommunityPinState();
-      promise.then((_result) => {
+      promise.then(({result: _result, cutoffGeneration, settingsAskedAt, draftsAskedAt}) => {
+        if(
+          cutoffGeneration !== undefined &&
+          cutoffGeneration !== this.appMessagesManager.getChannelAvailableMinIdGeneration()
+        ) {
+          this.onUpdatePinnedDialogs(update);
+          return;
+        }
         // * for test reordering and rendering
         // dialogsResult.dialogs.reverse();
 
@@ -2406,10 +2770,9 @@ export default class DialogsStorage extends AppManager {
             changedCommunityIds
           );
         }
-        this.applyDialogs(result);
+        this.applyDialogs(result, undefined, settingsAskedAt, draftsAskedAt);
 
         this.handleDialogsPinned(folderId, order);
-        this.appCommunitiesManager.handlePinnedDialogsOrder(folderId as REAL_FOLDER_ID);
       });
     }
   };
@@ -2429,15 +2792,24 @@ export default class DialogsStorage extends AppManager {
     } else {
       const limit = await this.apiManager.getLimit('topicPin', true);
 
-      const promise = this.apiManager.invokeApi('messages.getForumTopics', {
-        peer: this.appPeersManager.getInputPeerById(peerId),
-        limit,
-        offset_date: 0,
-        offset_id: 0,
-        offset_topic: 0
-      });
-
-      const result = await this.processTopics(peerId, promise);
+      let result: MessagesForumTopics;
+      for(let attempt = 0; ; ++attempt) {
+        const cutoffGeneration = this.appMessagesManager.getChannelAvailableMinIdGeneration(peerId);
+        result = await this.apiManager.invokeApi('messages.getForumTopics', {
+          peer: this.appPeersManager.getInputPeerById(peerId),
+          limit,
+          offset_date: 0,
+          offset_id: 0,
+          offset_topic: 0
+        });
+        if(
+          cutoffGeneration === this.appMessagesManager.getChannelAvailableMinIdGeneration(peerId) ||
+          attempt >= CHANNEL_CUTOFF_RETRY_LIMIT
+        ) {
+          break;
+        }
+      }
+      this.processTopics(peerId, result);
 
       const topics = result.topics as ForumTopic[];
       const pinned = topics.filter((topic) => topic.pFlags.pinned);

@@ -1,4 +1,6 @@
 import lastItem from '@helpers/array/lastItem';
+import Modes from '@config/modes';
+import {linkKeyDown} from '@helpers/solid/buttonKeyDown';
 import ListenerSetter from '@helpers/listenerSetter';
 import formatNumber from '@helpers/number/formatNumber';
 import {I18nTsx} from '@helpers/solid/i18n';
@@ -23,9 +25,8 @@ import isCollapsedCommunity from '@appManagers/utils/communities/isCollapsedComm
 import styles from './archiveDialog.module.scss';
 import Badge from './badge';
 import {IconTsx} from './iconTsx';
-import ripple from './ripple';
 import {createStoriesStore, StoriesContextValue} from './stories/store';
-import {createStoriesViewerWithProvider} from './stories/viewer';
+import {hotReloadGuard} from '@lib/solidjs/hotReloadGuardProvider';
 
 // if(import.meta.hot) import.meta.hot.accept(); // screw it
 
@@ -46,7 +47,21 @@ export const archiveDialogTagName = 'archive-dialog';
 const ArchiveDialog = defineSolidElement({
   name: archiveDialogTagName,
   component: (props: PassedProps<ArchiveDialogProps>, _, controls: Controls) => {
-    props.element.classList.add('row', 'no-wrap', 'row-with-padding', 'row-clickable', 'hover-effect', 'rp', 'chatlist-chat', 'chatlist-chat-bigger', 'row-big');
+    props.element.classList.add('row', 'no-wrap', 'row-with-padding', 'row-clickable', 'hover-effect', 'chatlist-chat', 'chatlist-chat-bigger', 'row-big');
+
+    // Every other row in this list is a link and opens on Enter by itself. This
+    // one is a custom element with no href, so its semantics have to be spelled
+    // out — and what it is is a LINK: it goes to the archive exactly the way its
+    // neighbours go to a chat. Calling it a button would be the easier wiring
+    // and the wrong word, and it would cost the row its Space key, which in a
+    // list belongs to the scroll. The click this raises carries `detail === 0`,
+    // which is what the list's own handler reads as a keyboard activation — the
+    // archive still opens down the one path every row uses.
+    props.element.setAttribute('role', 'link');
+    if(Modes.a11y) props.element.tabIndex = 0;
+    const onKeyDown = (e: KeyboardEvent) => linkKeyDown(e, props.element);
+    props.element.addEventListener('keydown', onKeyDown);
+    onCleanup(() => props.element.removeEventListener('keydown', onKeyDown));
 
     const [openStoriesTarget, setOpenStoriesTarget] = createSignal<HTMLElement>();
 
@@ -57,8 +72,6 @@ const ArchiveDialog = defineSolidElement({
     // Note: we cannot use createStore on dialogs, because it requires reacting to the whole object change and then sending it into
     // the shared worker thread to compute whether it is unread or not
     const [cachedDialogUnread, setCachedDialogUnread] = createStore<Record<PeerId, boolean>>({});
-
-    ripple(props.element, () => true);
 
     controls.openStory = () => {
       props.state.openArchiveStories(openStoriesTarget());
@@ -89,9 +102,14 @@ const ArchiveDialog = defineSolidElement({
             </For>
           </div>
           <Show when={totalUnreadCount() > 0}>
-            <Badge class={styles.UnreadBadge} tag="span" size={22} color="gray">
-              {formatNumber(totalUnreadCount(), 1)}
-            </Badge>
+            <Badge
+              class={styles.UnreadBadge}
+              tag="span"
+              size={22}
+              color="gray"
+              count={totalUnreadCount()}
+              format={(count) => formatNumber(count, 1)}
+            />
           </Show>
         </div>
       </>
@@ -379,7 +397,7 @@ function useOpenArchiveStories(storiesContextValue: StoriesContextValue) {
       setViewerTarget(undefined);
     };
 
-    createStoriesViewerWithProvider({
+    hotReloadGuard.createStoriesViewerWithProvider({
       onExit,
       target: viewerTarget
     }, {

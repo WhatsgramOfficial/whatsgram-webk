@@ -9,7 +9,7 @@
 
 import type ChatInput from '../input';
 import {getAppWindow, getOverlayRoot} from '@helpers/appWindow';
-import {POSTING_NOT_ALLOWED_MAP} from '../input';
+import {POSTING_NOT_ALLOWED_MAP} from '@components/chat/postingNotAllowedMap';
 import {ChatType} from '../chatType';
 import opusDecodeController from '@lib/opusDecodeController';
 import VoiceWaveformAnalyser from '@helpers/voiceWaveformAnalyser';
@@ -26,10 +26,9 @@ import findUpClassName from '@helpers/dom/findUpClassName';
 import blurActiveElement from '@helpers/dom/blurActiveElement';
 import {attachClickEvent, simulateClickEvent} from '@helpers/dom/clickEvent';
 import {fastRaf} from '@helpers/schedulers';
-import PopupPeer from '@components/popups/peer';
+import showPeerPopup from '@components/popups/peer';
 import appMediaPlaybackController from '@components/appMediaPlaybackController';
 import toHHMMSS from '@helpers/string/toHHMMSS';
-import PopupElement from '@components/popups';
 import contextMenuController from '@helpers/contextMenuController';
 import {ChatRights} from '@appManagers/appChatsManager';
 import type {MessageSendingParams} from '@appManagers/appMessagesManager';
@@ -64,6 +63,8 @@ export default class ChatRecording {
   private recordingType: 'voice' | 'video' = 'voice';
   private recordPaused = false;
   private recordCanceled = false;
+  // * a start still waiting for the microphone or the camera finds the chat gone (an account switch closes it)
+  private destroyed = false;
   private recordStartTime = 0;
   private recordAccumulatedMs = 0;
   private recordingOverlayListener: Listener;
@@ -95,18 +96,26 @@ export default class ChatRecording {
   // menu, so the click that ends the press doesn't also start a recording.
   private recordModeLongPressed = false;
   private pinnedEphemeralSendingParams: MessageSendingParams;
+  // whether the recording goes as an ephemeral message, kept till it has stopped: the pinned params are taken
+  // as its data comes, and the native recorders hand their data over before they say they have stopped
+  private recordingEphemeral = false;
 
   private releaseMediaPlayback: () => void;
 
   constructor(private input: ChatInput) {
     this.constructRecorder();
 
+    const isStory = this.input.chat.type === ChatType.Stories;
     this.voiceRecordingPanel = new VoiceRecordingPanel({
       onCancel: () => this.onCancelRecordClick(),
       onPauseToggle: () => this.onPauseToggleClick(),
       onPlayToggle: () => this.onPlayToggleClick(),
       onSeek: (progress) => this.onPlaybackSeek(progress)
     });
+    // * dark over a story, as the rest of the field there is
+    if(isStory) {
+      this.voiceRecordingPanel.element.classList.add('night');
+    }
     // The panel is an absolutely-positioned overlay inside the input row.
     // It sits *under* btnSendContainer in DOM order so the send button stays
     // on top while everything else (attach, input, emoji) is hidden via CSS.
@@ -121,7 +130,8 @@ export default class ChatRecording {
       // Just the centered round preview — all recording controls stay in the
       // chat input (the same voiceRecordingPanel + btn-send the voice flow
       // uses). Mounted on <body> so it's reliably screen-centered.
-      this.videoRecordingPanel = createVideoRecordingPanel();
+      // * a story's reply is recorded over the stories viewer, which stands above the chat
+      this.videoRecordingPanel = createVideoRecordingPanel(isStory);
       getOverlayRoot().append(this.videoRecordingPanel.element);
     }
 
@@ -220,15 +230,25 @@ export default class ChatRecording {
       };
       const isEphemeral = !!sendingParams.ephemeral;
       this.pinnedEphemeralSendingParams = undefined;
+      // * as long as it was recorded, not as long as the questions below kept it waiting
+      const duration = this.getRecordingElapsedMs() / 1000 | 0;
+
+      // * what is not sent lets the decoder go too, as the send does once it is decoded
+      if(!(await this.input.isSendingConfirmed())) {
+        opusDecodeController.setKeepAlive(false);
+        return;
+      }
 
       if(!isEphemeral) {
         const preparedPaymentResult = await this.input.paidMessageInterceptor.prepareStarsForPayment(1);
-        if(preparedPaymentResult === PAYMENT_REJECTED) return;
+        if(preparedPaymentResult === PAYMENT_REJECTED) {
+          opusDecodeController.setKeepAlive(false);
+          return;
+        }
 
         sendingParams.confirmedPaymentResult = preparedPaymentResult;
       }
 
-      const duration = this.getRecordingElapsedMs() / 1000 | 0;
       const dataBlob = new Blob([typedArray as BlobPart], {type: 'audio/ogg'});
       opusDecodeController.decode(typedArray, false).then((result) => {
         opusDecodeController.setKeepAlive(false);
@@ -251,6 +271,12 @@ export default class ChatRecording {
 
     if(this.videoRecorder) {
       this.videoRecorder.onstop = () => {
+        // the preview flies into the round video's circle, instead of fading
+        const circle = this.videoRecordingPanel?.element.querySelector<HTMLElement>('.video-recording-circle');
+        if(circle && this.isStoppedToSend()) {
+          this.input.chat.bubbles?.sendFlights?.captureRound({circle, video: this.videoRecordingPanel.previewVideo});
+        }
+
         this.setRecording(false);
         this.videoLimitReached = false;
         this.input.chatInput.classList.remove('is-locked');
@@ -297,13 +323,17 @@ export default class ChatRecording {
         };
         const isEphemeral = !!sendingParams.ephemeral;
         this.pinnedEphemeralSendingParams = undefined;
+        const duration = this.getRecordingElapsedMs() / 1000 | 0;
+        if(!(await this.input.isSendingConfirmed())) {
+          return;
+        }
+
         if(!isEphemeral) {
           const preparedPaymentResult = await this.input.paidMessageInterceptor.prepareStarsForPayment(1);
           if(preparedPaymentResult === PAYMENT_REJECTED) return;
           sendingParams.confirmedPaymentResult = preparedPaymentResult;
         }
 
-        const duration = this.getRecordingElapsedMs() / 1000 | 0;
         const thumb = await thumbPromise;
         // The Blob already carries the recorder's mime type. We hand it to
         // sendFile with isRoundMessage=true so the documentAttributeVideo flag
@@ -803,11 +833,13 @@ export default class ChatRecording {
       return;
     }
 
+    if(value) this.input.setMessageInputExpanded(false);
+
     this.active = value;
     this.input.inputState.set({isRecording: value});
     this.input.setShrinking(this.active, ['is-recording']);
+    this.input.onRecordingChange(value);
     this.input.updateSendBtn();
-    this.input.onRecording?.(value);
   }
 
   // Swallow the click that ends a record-button long-press (it already opened
@@ -828,6 +860,11 @@ export default class ChatRecording {
   // button's record/send icon choice (no voice recorder ⇒ never a record icon).
   public hasVoiceRecorder(): boolean {
     return !!this.recorder;
+  }
+
+  // a recording that stops now is sent to this chat as it is shown
+  private isStoppedToSend() {
+    return !this.recordCanceled && !this.input.scheduleDate && !this.recordingEphemeral;
   }
 
   // Handle the send button's recording branch: stop+send (or cancel if too
@@ -856,7 +893,6 @@ export default class ChatRecording {
       !this.input.forwarding &&
       !this.input.editMsgId &&
       !this.input.suggestedPost?.hasMedia &&
-      this.input.chat.type !== ChatType.Stories &&
       !!this.recorder &&
       !!this.videoRecorder;
   }
@@ -876,7 +912,7 @@ export default class ChatRecording {
         onClick: () => this.setRecordingMediaType('voice'),
         verify: () => this.canSwitchRecordingMode() && this.getActiveRecordingMediaType() !== 'voice'
       }, {
-        icon: 'recordround',
+        icon: 'recordround_filled',
         text: 'Chat.Input.Record.Video',
         onClick: () => this.setRecordingMediaType('video'),
         verify: () => this.canSwitchRecordingMode() && this.getActiveRecordingMediaType() !== 'video'
@@ -950,6 +986,7 @@ export default class ChatRecording {
       replyToMsgId: sendingParams.replyToMsgId,
       replyTo: sendingParams.replyTo
     } : undefined;
+    this.recordingEphemeral = !!sendingParams.ephemeral;
     this.isStartingRecording = true;
     const promise = type === 'video' ? this.startVideoRecording() : this.startVoiceRecording();
     Promise.resolve(promise).catch(() => {}).finally(() => {
@@ -985,7 +1022,7 @@ export default class ChatRecording {
       }
     }
 
-    if(restricted) {
+    if(restricted || this.destroyed) {
       this.input.chatInput.classList.remove('is-locked');
       return;
     }
@@ -1005,6 +1042,13 @@ export default class ChatRecording {
     }
 
     this.recorder.start().then(() => {
+      // * the chat went while the microphone was being asked for: it is let go at once, nothing recorded
+      if(this.destroyed) {
+        this.recordCanceled = true;
+        this.recorder.stop();
+        return;
+      }
+
       this.releaseMediaPlayback = appMediaPlaybackController.setSingleMedia();
       this.recordCanceled = false;
       this.recordPaused = false;
@@ -1016,7 +1060,7 @@ export default class ChatRecording {
       opusDecodeController.setKeepAlive(true);
 
       const showDiscardPopup = () => {
-        PopupElement.createPopup(PopupPeer, 'popup-cancel-record', {
+        showPeerPopup('popup-cancel-record', {
           titleLangKey: 'DiscardVoiceMessageTitle',
           descriptionLangKey: 'DiscardVoiceMessageDescription',
           buttons: [{
@@ -1028,7 +1072,7 @@ export default class ChatRecording {
             langKey: 'Continue',
             isCancel: true
           }]
-        }).show();
+        });
       };
 
       this.recordingOverlayListener = this.input.listenerSetter.add(getOverlayRoot())('mousedown', (e) => {
@@ -1109,6 +1153,10 @@ export default class ChatRecording {
     // in settings takes effect on the next recording.
     this.videoRecorder.setDeviceIds(appSettings.callDevices?.cameraId, appSettings.callDevices?.microphoneId);
 
+    if(this.destroyed) {
+      return;
+    }
+
     try {
       await this.videoRecorder.start();
     } catch(e) {
@@ -1129,6 +1177,14 @@ export default class ChatRecording {
       }
       this.setRecording(false);
       this.input.chatInput.classList.remove('is-locked');
+      return;
+    }
+
+    // * the chat went while the camera was being asked for: it is let go at once, nothing recorded
+    if(this.destroyed) {
+      this.recordCanceled = true;
+      this.videoRecorder.stop();
+      this.videoRecorder.releaseStream();
       return;
     }
 
@@ -1157,7 +1213,7 @@ export default class ChatRecording {
     this.setupVideoWaveform();
 
     const showDiscardPopup = () => {
-      PopupElement.createPopup(PopupPeer, 'popup-cancel-record', {
+      showPeerPopup('popup-cancel-record', {
         titleLangKey: 'DiscardVoiceMessageTitle',
         descriptionLangKey: 'DiscardVoiceMessageDescription',
         buttons: [{
@@ -1169,7 +1225,7 @@ export default class ChatRecording {
           langKey: 'Continue',
           isCancel: true
         }]
-      }).show();
+      });
     };
 
     this.recordingOverlayListener = this.input.listenerSetter.add(getOverlayRoot())('mousedown', (e) => {
@@ -1293,6 +1349,13 @@ export default class ChatRecording {
   }
 
   public destroy() {
+    this.destroyed = true;
+    // A recording still in flight goes with the chat (an account switch closes it): cancelling it lets the
+    // microphone - or the camera - go, which nothing else would.
+    if(this.active) {
+      this.onCancelRecordClick();
+    }
+
     // The round-preview element lives on <body>, outside the input subtree, so
     // tear it down explicitly. Also release the camera in case a recording (or
     // its warm-up) is still in flight.

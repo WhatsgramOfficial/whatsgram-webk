@@ -24,7 +24,7 @@ import appDownloadManager from '@lib/appDownloadManager';
 import {AnimationItemGroup} from '@components/animationIntersector';
 import wrapPhoto from '@components/wrappers/photo';
 import {i18n} from '@lib/langPack';
-import {POSTING_NOT_ALLOWED_MAP} from '@components/chat/input';
+import {POSTING_NOT_ALLOWED_MAP} from '@components/chat/postingNotAllowedMap';
 import liteMode from '@helpers/liteMode';
 
 const ANIMATION_GROUP: AnimationItemGroup = 'INLINE-HELPER';
@@ -55,12 +55,15 @@ export default class InlineHelper extends AutocompleteHelper {
         const {peerId, botId, queryId} = this.list.dataset;
         return this.chat.input.getReadyToSend(() => {
           const queryAndResultIds = generateQId(queryId, (target as HTMLElement).dataset.resultId);
-          this.managers.appInlineBotsManager.sendInlineResult(peerId.toPeerId(), botId, queryAndResultIds, {
-            ...this.chat.getMessageSendingParams(),
-            clearDraft: true
-          });
+          const sendingParams = this.chat.getMessageSendingParams();
+          this.chat.input.whenSendingConfirmed(() => {
+            this.managers.appInlineBotsManager.sendInlineResult(peerId.toPeerId(), botId, queryAndResultIds, {
+              ...sendingParams,
+              clearDraft: true
+            });
 
-          this.chat.input.onMessageSent(true, true);
+            this.chat.input.onMessageSent(true, true);
+          });
         });
       }
     });
@@ -276,7 +279,9 @@ export default class InlineHelper extends AutocompleteHelper {
           setInnerHTML(btnSwitchTo, wrapEmojiText(switchTo.text));
           attachClickEvent(btnSwitchTo, async(e) => {
             if(switchTo._ === 'inlineBotSwitchPM') {
-              await this.chat.appImManager.setInnerPeer({peerId});
+              // * to the bot's chat, started with the result's parameter: its switch-inline button brings the user
+              // * back to this chat (checkSwitchReturn), as tdesktop does (inline_results_inner.cpp, switchPm)
+              await this.chat.appImManager.setInnerPeer({peerId: botId.toPeerId(false)});
               this.managers.appInlineBotsManager.switchToPM(peerId, botId, switchTo.start_param);
             } else {
               this.chat.openWebApp({

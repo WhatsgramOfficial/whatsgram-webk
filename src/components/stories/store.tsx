@@ -4,19 +4,24 @@ import {createStore, reconcile} from 'solid-js/store';
 import mediaSizes from '@helpers/mediaSizes';
 import clamp from '@helpers/number/clamp';
 import windowSize from '@helpers/windowSize';
-import {StoryItem, PeerStories, StoryAlbum, StoriesStealthMode} from '@layer';
+import {StoryItem, PeerStories, StoryAlbum, StoriesStealthMode, MediaArea} from '@layer';
 import StoriesCacheType from '@appManagers/utils/stories/cacheType';
 import insertStory from '@appManagers/utils/stories/insertStory';
 import rootScope, {BroadcastEvents} from '@lib/rootScope';
-import {STORY_DURATION} from '@components/stories/viewer';
 import createListenerSetter from '../../helpers/solid/createListenerSetter';
 import insertInDescendSortedArray from '@helpers/array/insertInDescendSortedArray';
 import {AnyFunction} from '@types';
 import findAndSplice from '@helpers/array/findAndSplice';
+import putInOrder from '@helpers/array/putInOrder';
 import forEachReverse from '@helpers/array/forEachReverse';
 import getPeerId from '@appManagers/utils/peers/getPeerId';
 import AppStoriesManager from '@appManagers/appStoriesManager';
 import untrackActions from '@helpers/solid/untrackActions';
+import {hotListen} from '@helpers/hotModule';
+
+/** how long a story without a video stays on screen */
+export const STORY_DURATION = 5e3;
+const SEARCH_PAGE_LIMIT = 30;
 
 export type NextPrevStory = () => void;
 export type ChangeStoryParams = {
@@ -34,6 +39,13 @@ export type StoriesContextPeerState = {
 };
 
 export type StoriesSortingFreezeType = 'list' | 'viewer';
+
+/** public stories with a hashtag (of one peer's with `peerId`), or from the place of a location area */
+export type StoriesSearch = {
+  hashtag?: string,
+  area?: MediaArea,
+  peerId?: PeerId
+};
 
 export type StoriesContextState = {
   index: number,
@@ -58,9 +70,16 @@ export type StoriesContextState = {
   peers: StoriesContextPeerState[],
   peer: StoriesContextPeerState,
   getNearestStory: (next: boolean, loop?: boolean, offsetIndex?: number, offsetPeer?: StoriesContextPeerState, offsetStoryIndex?: number) => ChangeStoryParams,
+  getNearestStories: (next: boolean, count: number, loop?: boolean) => ChangeStoryParams[],
   albumId: number | undefined,
   loaded: boolean,
-  canEdit: boolean
+  canEdit: boolean,
+  /** how many stories a search found: the server's count while there are more pages */
+  foundCount: number,
+  // * how fast the videos play: one speed for the whole viewer, as on iOS
+  playbackRate: number,
+  // * held and dragged along to move through the video (touch only)
+  seeking: boolean
 };
 
 export type StoriesContextActions = {
@@ -78,12 +97,23 @@ export type StoriesContextActions = {
   resetIndexes: () => void,
   toggleMute: () => void,
   toggleInterface: (hide: boolean) => void,
+  setCovered: (covered: boolean) => void,
   toggleSorting: (type: StoriesSortingFreezeType, freeze: boolean) => void,
   load: () => Promise<boolean>,
-  setBuffering: (buffering: boolean) => void,
+  setBuffering: (owner: object, buffering: boolean) => void,
   setLoop: (loop: boolean) => void,
   setAlbumId: (albumId: number | undefined) => void,
-  handleSwipe: (xDiff: number, setAlbumOverride?: (albumId: number | undefined) => void) => boolean
+  setPlaybackRate: (playbackRate: number) => void,
+  setSeeking: (seeking: boolean) => void,
+  seek: (progress: number) => void,
+  setStoryDuration: (storyDuration: number) => void,
+  getProgress: () => number | undefined,
+  handleSwipe: (xDiff: number, setAlbumOverride?: (albumId: number | undefined) => void) => boolean,
+  /**
+   * Shows a list's stories or albums in the order they were dragged into, in the same task as the
+   * drop - the managers answer with the very same order a moment later
+   */
+  reorder: (order: {stories?: number[], albums?: number[]}) => void
 };
 
 export type StoriesContextValue = [
@@ -113,7 +143,33 @@ const createPositions = (positions: Map<PeerId, StoriesListPosition> = new Map()
 };
 
 const {positions: globalPositions, onPosition} = createPositions();
-rootScope.addEventListener('stories_position', onPosition);
+hotListen(import.meta.hot, rootScope, 'stories_position', onPosition);
+
+/**
+ * `stories_position` only fires when a position CHANGES, so a tab that attached to an
+ * already-running shared worker (a reload, a second tab) never learns the positions computed
+ * before it — every peer would then fall back to the sort key below and land in arrival order,
+ * with "My Story" wherever the server happened to put it. Read the worker's snapshot once, and
+ * never over an event that already came in: that one is newer than the snapshot.
+ */
+let globalPositionsPromise: Promise<void>;
+const loadGlobalPositions = () => globalPositionsPromise ??= rootScope.managers.appStoriesManager.getListPositions()
+.then((positions) => {
+  for(const peerId in positions) {
+    const id = +peerId as PeerId;
+    if(!globalPositions.has(id)) {
+      onPosition({peerId: id, position: positions[id]});
+    }
+  }
+}, () => {
+  globalPositionsPromise = undefined; // a failed read must not leave the list sorted by the fallback forever
+});
+
+// * another account has another list of stories: its positions are read anew
+hotListen(import.meta.hot, rootScope, 'account_switched', () => {
+  globalPositions.clear();
+  globalPositionsPromise = undefined;
+});
 
 export const createStoriesStore = (props: {
   peers?: StoriesContextPeerState[],
@@ -125,7 +181,9 @@ export const createStoriesStore = (props: {
   manualLoad?: boolean,
   onLoad?: (fullLoad: boolean) => void,
   initialAlbumId?: number,
-  singleStory?: boolean
+  singleStory?: boolean,
+  /** the found stories, in the order found: a peer once for each story */
+  search?: StoriesSearch
 }): StoriesContextValue => {
   const getNearestStory = (
     next: boolean,
@@ -168,6 +226,30 @@ export const createStoriesStore = (props: {
     }
   };
 
+  const getNearestStories = (next: boolean, count: number, loop?: boolean): ChangeStoryParams[] => {
+    let nearestStory: ChangeStoryParams | undefined;
+    const out: ChangeStoryParams[] = [];
+    for(let i = 0; i < count; ++i) {
+      nearestStory = state.getNearestStory(
+        next,
+        loop,
+        nearestStory?.peer ? state.peers.indexOf(nearestStory.peer) : undefined,
+        undefined,
+        // * walk on from the story just reached — the stored index doesn't move, so without this
+        // * every iteration would return the very same story
+        nearestStory?.index
+      );
+
+      if(!nearestStory) {
+        break;
+      }
+
+      out.push(nearestStory);
+    }
+
+    return out;
+  };
+
   const initialState: StoriesContextState = {
     index: props.index || 0,
     paused: true,
@@ -195,9 +277,13 @@ export const createStoriesStore = (props: {
       return state.peers[state.index];
     },
     getNearestStory,
+    getNearestStories,
     albumId: props.initialAlbumId as number | undefined,
     loaded: false,
-    canEdit: false
+    canEdit: false,
+    foundCount: 0,
+    playbackRate: 1,
+    seeking: false
   };
 
   let loadState: string;
@@ -205,6 +291,7 @@ export const createStoriesStore = (props: {
   let changeTimeout: number;
   // * plain closure state: a `Set` is not wrappable, so keeping it in the store only pretends to be reactive
   const freezedSorting = new Set<StoriesSortingFreezeType>();
+  const bufferingOwners = new Set<object>();
   const albumCache = new Map<number | undefined, AlbumCacheItem>();
   const [state, setState] = createStore(initialState);
 
@@ -219,34 +306,20 @@ export const createStoriesStore = (props: {
   const {positions, onPosition} = createPositions(new Map(globalPositions));
   const postponedPositions: Array<BroadcastEvents['stories_position']> = [];
 
+  // This store copied `globalPositions` when it was created, which for the sidebar's list is before
+  // the snapshot above has landed — take whatever it added, still without touching a live event.
+  const syncPositions = () => loadGlobalPositions().then(() => {
+    globalPositions.forEach((position, peerId) => {
+      if(!positions.has(peerId)) {
+        positions.set(peerId, position);
+      }
+    });
+  });
+
   const getPeerInitialIndex = (peer: StoriesContextPeerState): number => {
     const maxReadId = peer.maxReadId || 0;
     const unreadIndex = peer.stories.findIndex((storyItem) => storyItem.id > maxReadId);
     return Math.max(0, unreadIndex);
-  };
-
-  const getNearestStories = (next: boolean, count: number, loop?: boolean): ChangeStoryParams[] => {
-    let nearestStory: ChangeStoryParams | undefined;
-    const out: ChangeStoryParams[] = [];
-    for(let i = 0; i < count; ++i) {
-      nearestStory = state.getNearestStory(
-        next,
-        loop,
-        nearestStory?.peer ? state.peers.indexOf(nearestStory.peer) : undefined,
-        undefined,
-        // * walk on from the story just reached — the stored index doesn't move, so without this
-        // * every iteration would return the very same story
-        nearestStory?.index
-      );
-
-      if(!nearestStory) {
-        break;
-      }
-
-      out.push(nearestStory);
-    }
-
-    return out;
   };
 
   const checkForNearestSkipped = () => {
@@ -261,10 +334,57 @@ export const createStoriesStore = (props: {
     });
   };
 
+  // * where the next page of found stories starts: what the last page gave, none after the last one
+  let searchOffset = '';
+  const loadFound = (reload: boolean): Promise<boolean> => {
+    if(reload) {
+      searchOffset = '';
+    } else if(state.loaded) {
+      return Promise.resolve(true);
+    }
+
+    return rootScope.managers.appStoriesManager.searchStories({
+      ...props.search,
+      offset: searchOffset,
+      limit: SEARCH_PAGE_LIMIT
+    }).catch((): Awaited<ReturnType<AppStoriesManager['searchStories']>> => ({count: 0, nextOffset: undefined, stories: []}))
+    .then(({count, nextOffset, stories}) => {
+      if(disposed) {
+        return true;
+      }
+
+      searchOffset = nextOffset;
+      const loaded = !nextOffset;
+      const peers = reload ? [] : state.peers.slice();
+      const keys = new Set(peers.map((peer) => `${peer.peerId}_${peer.stories[0].id}`));
+      for(const {peerId, story} of stories) {
+        const key = `${peerId}_${story.id}`;
+        if(!keys.has(key)) { // * a page can repeat a story of the one before
+          keys.add(key);
+          peers.push({peerId, stories: [story], index: 0, count: 1});
+        }
+      }
+
+      setState({
+        peers,
+        ready: true,
+        loaded,
+        foundCount: loaded ? peers.length : Math.max(count, peers.length)
+      });
+
+      props.onLoad?.(loaded);
+      return loaded;
+    });
+  };
+
   const load = (reload = false) => {
     if(loadPromise && !reload) return loadPromise;
     const doLoad = () => {
       const {peerId, pinned, archive} = props;
+      if(props.search) {
+        return loadFound(reload);
+      }
+
       if(peerId) {
         if(pinned || archive) {
           const {peer} = state;
@@ -315,11 +435,16 @@ export const createStoriesStore = (props: {
         });
       }
 
-      return rootScope.managers.appStoriesManager.getAllStories(
-        loadState ? true : undefined,
-        loadState,
-        archive
-      ).then((storiesAllStories) => {
+      // the positions come along for the ride: `addPeerStories` sorts by them, so they have to be
+      // in hand before the first peer is placed, not whenever the worker next happens to move one
+      return Promise.all([
+        rootScope.managers.appStoriesManager.getAllStories(
+          loadState ? true : undefined,
+          loadState,
+          archive
+        ),
+        syncPositions()
+      ]).then(([storiesAllStories]) => {
         const previousLoadState = loadState;
         loadState = storiesAllStories.state;
         // * now that the next page is actually fetched, a server that keeps `has_more` on an
@@ -349,6 +474,11 @@ export const createStoriesStore = (props: {
 
     return promise;
   };
+
+  // * what stands over the viewer — a popup, the media viewer — holds the story still, and a play asked for under
+  // * it (a popup's own resume as it closes, with the next one already open) waits for it to go: nothing ever plays
+  // * behind what covers it
+  let covered = false, playWhenUncovered = false;
 
   const actions: StoriesContextActions = {
     set: (params) => {
@@ -386,12 +516,20 @@ export const createStoriesStore = (props: {
     },
 
     pause: (hideInterface) => {
+      playWhenUncovered = false;
       setState({paused: true, playAfterGesture: !!hideInterface && !state.paused});
       actions.toggleInterface(hideInterface);
     },
 
+    // * while buffering it is kept to be done: the clock waits for the data either way (on pause or buffering)
     play: (storyDuration = state.storyDuration) => {
-      if(state.buffering || !state.hasViewer) {
+      if(!state.hasViewer) {
+        return;
+      }
+
+      if(covered) {
+        playWhenUncovered = true;
+        setState({storyDuration});
         return;
       }
 
@@ -406,6 +544,7 @@ export const createStoriesStore = (props: {
     },
 
     restart: () => {
+      bufferingOwners.clear();
       setState({buffering: false});
       actions.stop();
       actions.play();
@@ -457,6 +596,26 @@ export const createStoriesStore = (props: {
       setState({hideInterface: hide});
     },
 
+    setCovered: (_covered) => {
+      if(covered === _covered) {
+        return;
+      }
+
+      if(_covered) {
+        const resume = !state.paused;
+        actions.pause();
+        covered = true;
+        playWhenUncovered = resume;
+        return;
+      }
+
+      covered = false;
+      if(playWhenUncovered) {
+        playWhenUncovered = false;
+        actions.play();
+      }
+    },
+
     toggleSorting: (type, freeze) => {
       if(freeze) freezedSorting.add(type);
       else {
@@ -477,8 +636,14 @@ export const createStoriesStore = (props: {
 
     load,
 
-    setBuffering: (buffering) => {
-      setState({buffering});
+    // * the clock waits while anyone needs data - a video, the other quality's file loading - and each
+    // * takes back only its own: one done never lets the clock run over another still waiting
+    setBuffering: (owner, buffering) => {
+      if(buffering) bufferingOwners.add(owner);
+      else bufferingOwners.delete(owner);
+      if(state.buffering !== !!bufferingOwners.size) {
+        setState({buffering: !!bufferingOwners.size});
+      }
     },
 
     setLoop: (loop) => {
@@ -511,6 +676,34 @@ export const createStoriesStore = (props: {
       }
     },
 
+    setPlaybackRate: (playbackRate) => {
+      setState({playbackRate});
+    },
+
+    setSeeking: (seeking) => {
+      setState({seeking});
+    },
+
+    seek: (progress) => {
+      setPosition(clamp(progress, 0, 1) * state.storyDuration);
+    },
+
+    // * a video played at another speed takes another time: what has gone of it stays gone
+    setStoryDuration: (storyDuration) => {
+      const previous = state.storyDuration;
+      if(!previous || !state.startTime) {
+        setState({storyDuration});
+        return;
+      }
+
+      setPosition(getElapsedTime() / previous * storyDuration, storyDuration);
+    },
+
+    // * how far the story has gone, 0 to 1: none before it started
+    getProgress: () => {
+      return state.startTime && state.storyDuration ? Math.min(1, getElapsedTime() / state.storyDuration) : undefined;
+    },
+
     handleSwipe: (xDiff: number, setAlbumOverride?: (albumId: number | undefined) => void) => {
       const albums = state.peers[0]?.albums;
       if(!albums?.length) return false;
@@ -525,10 +718,45 @@ export const createStoriesStore = (props: {
       const newAlbumId = newIndex === -1 ? undefined : albums[newIndex].album_id;
       (setAlbumOverride ?? actions.setAlbumId)(newAlbumId);
       return true;
+    },
+
+    reorder: ({stories, albums}) => {
+      const peer = state.peers[0];
+      if(!peer) {
+        return;
+      }
+
+      batch(() => {
+        if(stories) {
+          setState('peers', 0, 'stories', putInOrder(peer.stories, stories, (story) => story.id));
+        }
+
+        if(albums && peer.albums) {
+          setState('peers', 0, 'albums', putInOrder(peer.albums, albums, (album) => album.album_id));
+        }
+      });
     }
   };
 
   untrackActions(actions);
+
+  const isRunning = () => !state.paused && !state.buffering;
+  const getElapsedTime = () => isRunning() ? Date.now() - state.startTime : state.elapsedTimeOnPause;
+
+  // * puts the story's clock at `elapsed`: a running one goes on from there, a paused one starts from
+  // * there when played
+  const setPosition = (elapsed: number, storyDuration = state.storyDuration) => {
+    if(!state.startTime) { // * not started: there is nothing to move
+      return;
+    }
+
+    batch(() => {
+      setState({storyDuration, elapsedTimeOnPause: elapsed, startTime: Date.now() - elapsed});
+      if(isRunning()) {
+        setChangeTimeout();
+      }
+    });
+  };
 
   const setChangeTimeout = () => {
     clearTimeout(changeTimeout);
@@ -629,6 +857,9 @@ export const createStoriesStore = (props: {
 
       insertInDescendSortedArray(peers, peer, (peer) => {
         const position = positions.get(peer.peerId);
+        // 0 sinks a peer to the bottom of the list. With the positions read up front this only
+        // covers a peer whose story arrived before its position did, and the `stories_position`
+        // that follows puts it back — it must never be how a whole list gets ordered.
         return position?.index ?? 0;
       }, previousPeerIdx);
     }
@@ -657,6 +888,10 @@ export const createStoriesStore = (props: {
   };
 
   const canAddPeer = (peerId: PeerId) => {
+    if(props.search) { // * the server alone says what was found
+      return false;
+    }
+
     if(singlePeerId) {
       return singlePeerId === peerId;
     }
@@ -675,7 +910,11 @@ export const createStoriesStore = (props: {
     setState({ready: true});
   };
 
-  const deletePeer = (peerId: PeerId, peerIndex = getPeerIndex(peerId)) => {
+  // The default is resolved in the body, not in the parameter list: the production
+  // minifier has been caught misbinding a parameter referenced from another
+  // parameter's default (see scripts/check-bundle-mangling.mjs, which fails on it).
+  const deletePeer = (peerId: PeerId, peerIndexArg?: number) => {
+    const peerIndex = peerIndexArg ?? getPeerIndex(peerId);
     if(peerIndex === -1) {
       return;
     }
@@ -800,9 +1039,16 @@ export const createStoriesStore = (props: {
     return isActivePeer;
   };
 
+  // * found stories hold a peer once for each of its stories: the story picks which
+  const getStoryPeerIndex = (peerId: PeerId, id: number) => {
+    return props.search ?
+      state.peers.findIndex((peer) => peer.peerId === peerId && peer.stories[0]?.id === id) :
+      getPeerIndex(peerId);
+  };
+
   // * updates section
   const onStoryUpdate = ({peerId, story, modifiedPinned, modifiedArchive, modifiedPinnedToTop}: BroadcastEvents['story_update']) => {
-    const peerIndex = getPeerIndex(peerId);
+    const peerIndex = getStoryPeerIndex(peerId, story.id);
     if(peerIndex === -1) {
       return;
     }
@@ -921,7 +1167,7 @@ export const createStoriesStore = (props: {
       return;
     }
 
-    const peerIndex = getPeerIndex(peerId);
+    const peerIndex = getStoryPeerIndex(peerId, id);
     if(peerIndex === -1) {
       return;
     }
@@ -935,6 +1181,7 @@ export const createStoriesStore = (props: {
 
     if(stories.length === 1) {
       deletePeer(peerId, peerIndex);
+      if(props.search) setState('foundCount', (count) => Math.max(0, count - 1));
       return;
     }
 
@@ -1007,13 +1254,14 @@ export const createStoriesStore = (props: {
 
   listenerSetter.add(rootScope)('story_update', onStoryUpdate);
   listenerSetter.add(rootScope)('story_deleted', onStoryDeleted);
-  if(!props.archive && !props.pinned) {
+  // * a story found stays found past its 24 hours, and the feed's order and additions are not the search's
+  if(!props.archive && !props.pinned && !props.search) {
     listenerSetter.add(rootScope)('story_expired', onStoryDeleted);
   }
   if(!props.singleStory) {
     listenerSetter.add(rootScope)('story_new', onStoryNew);
   }
-  if(!singlePeerId || props.needUpdates) {
+  if((!singlePeerId || props.needUpdates) && !props.search) {
     listenerSetter.add(rootScope)('stories_stories', onStoriesStories);
     listenerSetter.add(rootScope)('stories_read', onStoriesRead);
     // listenerSetter.add(rootScope)('user_stories_hidden', onUserStoriesHidden);
@@ -1038,6 +1286,12 @@ export const createStoriesStore = (props: {
         albumCache.delete(albumId);
       }
       setState('peers', 0, 'albums', albums);
+    });
+
+    listenerSetter.add(rootScope)('story_albums_updated', ({peerId, albums}) => {
+      if(peerId !== singlePeerId) return;
+      // * by key, so that the chips of an order already shown stay where they are
+      setState('peers', 0, 'albums', reconcile(albums, {key: 'album_id'}));
     });
 
     listenerSetter.add(rootScope)('story_album_updated', ({peerId, albumId, albums}) => {

@@ -19,10 +19,12 @@ import setWorkerProxy from '@helpers/setWorkerProxy';
 import toggleAttributePolyfill from '@helpers/dom/toggleAttributePolyfill';
 import rootScope from '@lib/rootScope';
 import IS_TOUCH_SUPPORTED from '@environment/touchSupport';
-import I18n, {checkLangPackForUpdates, i18n, LangPackKey} from '@lib/langPack';
+import I18n, {checkLangPackForUpdates} from '@lib/langPack';
 import '@helpers/peerIdPolyfill';
 import '@lib/polyfill';
 import '@lib/debug/mountLogExport'; // main-thread-only: wires window.downloadLogs / collectLogs
+import '@lib/debug/memoryReport'; // main-thread-only: wires window.memoryReport
+import '@lib/debug/memoryWatch'; // main-thread-only: wires window.memoryWatch (crash-proof memory series)
 import apiManagerProxy from '@lib/apiManagerProxy';
 import getProxiedManagers from '@lib/getProxiedManagers';
 import themeController from '@helpers/themeController';
@@ -32,12 +34,13 @@ import singleInstance, {InstanceDeactivateReason} from '@lib/singleInstance';
 import {parseUriParamsLine} from '@helpers/string/parseUriParams';
 import Modes from '@config/modes';
 import {AuthState} from '@types';
-import DEBUG, {IS_BETA} from '@config/debug';
+import DEBUG, {IS_BETA, IS_POPUP_SANDBOX} from '@config/debug';
 import IS_INSTALL_PROMPT_SUPPORTED from '@environment/installPrompt';
 import cacheInstallPrompt from '@helpers/dom/installPrompt';
 import {fillLocalizedDates} from '@helpers/date';
 import {nextRandomUint} from '@helpers/random';
 import {createEffect} from 'solid-js';
+import {setHotReloadGuardLoader} from '@lib/solidjs/hotReloadGuardProvider';
 import {IS_OVERLAY_SCROLL_SUPPORTED, USE_CUSTOM_SCROLL, USE_NATIVE_SCROLL} from '@environment/overlayScrollSupport';
 import IMAGE_MIME_TYPES_SUPPORTED, {IMAGE_MIME_TYPES_SUPPORTED_PROMISE} from '@environment/imageMimeTypesSupport';
 import MEDIA_MIME_TYPES_SUPPORTED from '@environment/mediaMimeTypesSupport';
@@ -45,14 +48,15 @@ import {doubleRaf} from '@helpers/schedulers';
 import {getCurrentAccount} from '@lib/accounts/getCurrentAccount';
 import AccountController from '@lib/accounts/accountController';
 import {changeAccount} from '@lib/accounts/changeAccount';
+import {getValidatedAccount} from '@lib/accounts/getValidatedAccount';
 import {MAX_ACCOUNTS_FREE, MAX_ACCOUNTS_PREMIUM} from '@lib/accounts/constants';
 import sessionStorage from '@lib/sessionStorage';
 import replaceChildrenPolyfill from '@helpers/dom/replaceChildrenPolyfill';
 import listenForWindowPrint from '@helpers/dom/windowPrint';
 import cancelImageEvents from '@helpers/dom/cancelImageEvents';
-import PopupElement from '@components/popups';
+import listenForLinkPress from '@helpers/dom/linkPress';
+import {DeactivatedScreen, onStartImportFailed, showDeactivatedScreen} from '@/pages/deactivatedScreen';
 import PasscodeLockScreenController from '@components/passcodeLock/passcodeLockScreenController'; PasscodeLockScreenController;
-import type {LangPackDifference} from '@layer';
 import commonStateStorage from '@lib/commonStateStorage';
 import {useAppSettings, setAppSettingsSilent} from '@stores/appSettings';
 import {isUserCollapsedLeft} from '@helpers/updateColumnWidths';
@@ -84,7 +88,8 @@ IMAGE_MIME_TYPES_SUPPORTED_PROMISE.then((mimeTypes) => {
   apiManagerProxy.sendEnvironment();
 });
 
-// * Randomly choose a version if user came from a search engine
+// * Randomly choose a version if user came from a search engine, and keep it. The choice is Web A's key as
+// * well, kept as JSON: a choice made in either version stays
 function randomlyChooseVersionFromSearch() {
   try {
     if(
@@ -92,15 +97,25 @@ function randomlyChooseVersionFromSearch() {
       document.referrer &&
       /(^|\.)(google|bing|duckduckgo|ya|yandex)\./i.test(new URL(document.referrer).host)
     ) {
-      const version = localStorage.getItem('kz_version');
-      if(version === 'Z' || nextRandomUint(8) > 127) {
-        localStorage.setItem('kz_version', 'Z');
+      const version = getPermanentWebVersion();
+      if(version === 'Z' || (version !== 'K' && nextRandomUint(8) > 127)) {
+        localStorage.setItem('kz_version', JSON.stringify('Z'));
         appNavigationController.navigateToUrl('https://web.telegram.org/a/');
       } else {
-        localStorage.setItem('kz_version', 'K');
+        localStorage.setItem('kz_version', JSON.stringify('K'));
       }
     }
   } catch(err) {}
+}
+
+function getPermanentWebVersion() {
+  const value = localStorage.getItem('kz_version');
+  try {
+    return JSON.parse(value);
+  } catch(err) {
+    // * as an older K wrote it
+    return value;
+  }
 }
 
 async function checkLastActiveAccountFromTMe() {
@@ -124,7 +139,7 @@ async function checkLastActiveAccountFromTMe() {
 
 function setManifest() {
   const manifest = document.getElementById('manifest') as HTMLLinkElement;
-  if(manifest) manifest.href = `site${IS_APPLE && !IS_APPLE_MOBILE ? '_apple' : ''}.webmanifest?v=n8V4qL2pRs`;
+  if(manifest) manifest.href = `site${IS_APPLE && !IS_APPLE_MOBILE ? '_apple' : ''}.webmanifest?v=p9R6mT3xKv`;
 }
 
 function setViewportHeightListeners() {
@@ -235,6 +250,14 @@ function setSidebarLeftWidth() {
 function setRootClasses() {
   const add: string[] = [];
 
+  if(Modes.a11y) {
+    add.push('a11y');
+    // Pinch zoom. Not without the flag: with maximum-scale gone iOS also zooms
+    // into every field whose text is under 16px.
+    const viewport = document.querySelector<HTMLMetaElement>('meta[name="viewport"]');
+    if(viewport) viewport.content = viewport.content.replace(/,(maximum-scale=1|user-scalable=no)/g, '');
+  }
+
   if(IS_EMOJI_SUPPORTED) {
     add.push('native-emoji');
   }
@@ -254,7 +277,7 @@ function setRootClasses() {
     });
   }
 
-  // root.style.setProperty('--quote-icon', `"${getIconContent('quote')}"`);
+  // root.style.setProperty('--quote-icon', `"${getIconContent('quote_filled')}"`);
 
   if(IS_FIREFOX) {
     add.push('is-firefox', 'no-backdrop');
@@ -342,11 +365,7 @@ function onInstanceDeactivated(reason: InstanceDeactivateReason) {
 
   const onOtherClientClick = onTabsClick;
 
-  const map: {[key in InstanceDeactivateReason]: {
-    title: LangPackKey,
-    subtitle: LangPackKey,
-    onClick: () => void
-  }} = {
+  const map: {[key in InstanceDeactivateReason]: DeactivatedScreen} = {
     version: {
       title: 'Deactivated.Version.Title',
       subtitle: 'Deactivated.Version.Subtitle',
@@ -364,39 +383,22 @@ function onInstanceDeactivated(reason: InstanceDeactivateReason) {
     }
   };
 
-  const isUpdated = reason === 'version';
-  const popup = PopupElement.createPopup(PopupElement, 'popup-instance-deactivated', {overlayClosable: true});
-  const c = document.createElement('div');
-  c.classList.add('instance-deactivated-container');
-  (popup as any).container.replaceWith(c);
-
-  const header = document.createElement('div');
-  header.classList.add('header');
-  header.append(i18n(map[reason].title));
-
-  const subtitle = document.createElement('div');
-  subtitle.classList.add('subtitle');
-  subtitle.append(i18n(map[reason].subtitle));
-
-  c.append(header, subtitle);
-
-  document.body.classList.add('deactivated');
-
-  popup.addEventListener('close', map[reason].onClick);
-  popup.show();
+  showDeactivatedScreen(map[reason]);
 };
 
 const TIME_LABEL = 'Elapsed time since unlocked';
 
-function setDocumentLangPackProperties(langPack: LangPackDifference.langPackDifference) {
-  if(langPack.lang_code === 'ar' || langPack.lang_code === 'fa' && IS_BETA && false) {
-    document.documentElement.classList.add('is-rtl');
-    document.documentElement.dir = 'rtl';
-    document.documentElement.lang = langPack.lang_code;
-    I18n.setRTL(true);
-  } else {
-    document.documentElement.dir = 'ltr';
-  }
+/**
+ * The test servers have accounts and chats of their own (Modes.test, `?test=1`), and nothing else on the screen tells
+ * them from the real ones: the corner says so for as long as the page runs on them, the sign-in screens too. Here and
+ * not in a module of its own, which would be one more module whose edit reloads the page (importGraphBudget).
+ */
+function mountTestDcBadge() {
+  const badge = document.createElement('div');
+  badge.classList.add('test-dc-badge');
+  badge.dir = 'ltr';
+  badge.textContent = 'Test DC';
+  document.body.append(badge);
 }
 
 (window as any)['showIconLibrary'] = async() => {
@@ -404,19 +406,61 @@ function setDocumentLangPackProperties(langPack: LangPackDifference.langPackDiff
   showIconLibrary();
 };
 
+// The popup sandbox, over a running app (`?popups=1` boots straight into it instead). The bare
+// `import.meta.env.DEV` is deliberate: only a `false` literal at the call site makes rolldown drop
+// the dynamic import before chunking. The authorized preview is a dev server, so it is covered, and
+// the bundle it builds for a remote device (`VITE_PREVIEW`, a literal too) keeps both sandboxes for
+// Settings → Experimental; a production build has neither.
+if(import.meta.env.DEV || import.meta.env.VITE_PREVIEW) {
+  (window as any)['showPopupSandbox'] = async() => {
+    const {showPopupSandbox} = await import('@components/popupSandbox');
+    await showPopupSandbox();
+  };
+
+  // the bubbles of the open chat, put in any state by click: the module, once loaded, puts its own opener in place of
+  // this one (`@components/bubbleSandbox`)
+  const loadBubbleSandbox = async() => {
+    await import('@components/bubbleSandbox');
+    const show = (window as any)['showBubbleSandbox'];
+    if(show !== loadBubbleSandbox) show();
+  };
+  (window as any)['showBubbleSandbox'] = loadBubbleSandbox;
+}
+
 /* false &&  */document.addEventListener('DOMContentLoaded', async() => {
   const perf = performance.now();
   randomlyChooseVersionFromSearch();
   setSidebarLeftWidth();
   toggleAttributePolyfill();
   replaceChildrenPolyfill();
-  rootScope.managers = getProxiedManagers();
   setManifest();
   setViewportHeightListeners();
   setWorkerProxy; // * just to import
   listenForWindowPrint();
   cancelImageEvents();
+  listenForLinkPress();
   setRootClasses();
+  if(Modes.test) mountTestDcBadge();
+
+  // ?popups=1 — the popup sandbox: every popup, opened by click with mock data and no session.
+  // It has to take over here, before the session is restored and the auth flow starts.
+  // The literal `import.meta.env.DEV` is not redundant with `IS_POPUP_SANDBOX` (which already
+  // implies it): only a `false` right at the call site makes rolldown drop the dynamic import
+  // before chunking, and with it the whole sandbox chunk. Behind the imported const alone the
+  // branch still folds away, but a ~150 KB orphan chunk is emitted that nothing ever loads.
+  if(import.meta.env.DEV && IS_POPUP_SANDBOX) {
+    // `bootstrapState` goes first, on its own: see the note at the top of that module.
+    await import('@components/popupSandbox/bootstrapState');
+    const {startPopupSandbox} = await import('@components/popupSandbox');
+    await startPopupSandbox();
+    return;
+  }
+
+  // the media editor the sign-up screen opens for the new account's photo mounts the app's top level, which nothing
+  // has loaded yet then
+  setHotReloadGuardLoader(() => import('./pages/bootstrapIm').then(({importAppTopLevel}) => importAppTopLevel()));
+
+  rootScope.managers = getProxiedManagers();
   await checkLastActiveAccountFromTMe();
 
   if(IS_INSTALL_PROMPT_SUPPORTED) {
@@ -435,8 +479,7 @@ function setDocumentLangPackProperties(langPack: LangPackDifference.langPackDiff
     appChatBackground.attach();
     appChatBackground.setBackground({transition: 'instant'});
 
-    const langPack = await I18n.getCacheLangPackAndApply();
-    setDocumentLangPackProperties(langPack);
+    await I18n.getCacheLangPackAndApply();
 
     if(IS_BETA) import('./pages/bootstrapIm'); // cache it
     // const settings = await commonStateStorage.get('settings');
@@ -511,7 +554,7 @@ function setDocumentLangPackProperties(langPack: LangPackDifference.langPackDiff
   themeController.setThemeListener();
 
   // * fetch lang pack updates
-  if((langPack.localVersion !== App.langPackLocalVersion || true) && IS_BETA) {
+  if((langPack.localVersion !== I18n.getLocalVersion() || true) && IS_BETA) {
     I18n.getLangPackAndApply(langPack.lang_code);
   } else {
     checkLangPackForUpdates();
@@ -544,19 +587,18 @@ function setDocumentLangPackProperties(langPack: LangPackDifference.langPackDiff
   appChatBackground.attach();
   appChatBackground.setBackground({transition: 'instant'});
 
-  setDocumentLangPackProperties(langPack);
-
   let authState = stateResult.state.authState;
 
   const hash = location.hash;
   const splitted = hash.split('?');
   const params = parseUriParamsLine(splitted[1] ?? splitted[0].slice(1));
+  const webAuthTokenIsTest = params.tgWebAuthTest !== undefined && !!+params.tgWebAuthTest;
   if(params.tgWebAuthToken && authState._ !== 'authStateSignedIn') {
     const data: AuthState.signImport['data'] = {
       token: params.tgWebAuthToken,
       dcId: +params.tgWebAuthDcId,
       userId: params.tgWebAuthUserId.toUserId(),
-      isTest: params.tgWebAuthTest !== undefined && !!+params.tgWebAuthTest,
+      isTest: webAuthTokenIsTest,
       tgAddr: params.tgaddr
     };
 
@@ -575,6 +617,13 @@ function setDocumentLangPackProperties(langPack: LangPackDifference.langPackDiff
     rootScope.managers.appStateManager.pushToState('authState', authState = {_: 'authStateSignImport', data});
   }
 
+  // Already signed in, so the import above never ran and the token is left
+  // hanging — a token for the other environment is unreachable from here, the
+  // rest is ours to drop.
+  if(params.tgWebAuthToken && authState._ === 'authStateSignedIn' && webAuthTokenIsTest === Modes.test) {
+    rootScope.managers.appAccountManager.cancelWebTokenAuthorization(params.tgWebAuthToken, +params.tgWebAuthDcId);
+  }
+
   if(params.tgWebAuthToken) {
     appNavigationController.overrideHash(params.tgaddr ? '#?tgaddr=' + encodeURIComponent(params.tgaddr) : '');
   }
@@ -583,14 +632,24 @@ function setDocumentLangPackProperties(langPack: LangPackDifference.langPackDiff
     console.log('Will mount auth page:', authState._, Date.now() / 1000);
 
     (async() => {
-      const totalAccounts = await AccountController.getTotalAccounts();
+      const [accountNumbers, freeAccountNumber] = await Promise.all([
+        AccountController.getAccountNumbers(),
+        AccountController.getFreeAccountNumber()
+      ]);
       const hasSomeonePremium = await apiManagerProxy.hasSomeonePremium();
       const maxAccountNumber = hasSomeonePremium ? MAX_ACCOUNTS_PREMIUM : MAX_ACCOUNTS_FREE;
 
       const currentAccount = getCurrentAccount();
+      // * the first slot is left empty when Web A signs its account out, with its other accounts still there:
+      // * the tab goes on to them with the link it was opened by, unless that link signs in here
+      const isEmptyFirstSlot = currentAccount === 1 && !!accountNumbers.length && authState._ !== 'authStateSignImport';
+      const canSignInHere = currentAccount === freeAccountNumber &&
+        accountNumbers.length < maxAccountNumber &&
+        !isEmptyFirstSlot;
 
-      if(currentAccount > Math.min(maxAccountNumber, totalAccounts + 1)) {
-        changeAccount(1);
+      const accountNumber = accountNumbers[0] ?? freeAccountNumber ?? 1;
+      if(!canSignInHere && accountNumber !== currentAccount) {
+        changeAccount(accountNumber, false, isEmptyFirstSlot);
       }
     })();
 
@@ -606,8 +665,22 @@ function setDocumentLangPackProperties(langPack: LangPackDifference.langPackDiff
 
     }
 
-    const {mountAuthFlow} = await import('./pages/mountAuthFlow');
-    mountAuthFlow(authState);
+    const {mountAuthFlow} = await import('./pages/mountAuthFlow').catch(onStartImportFailed);
+    const accountNumber = getCurrentAccount();
+    mountAuthFlow(authState, {
+      accountNumber,
+      managers: rootScope.managers,
+      // * a page opened on a slot of its own to add an account goes back to the account it was added from
+      back: accountNumber !== 1 ? async(host) => {
+        await sessionStorage.set({should_animate_main: 1});
+        const previousAccount = getValidatedAccount(await sessionStorage.get('previous_account'));
+        await sessionStorage.delete('previous_account');
+        await host.leave();
+        changeAccount(previousAccount);
+      } : undefined,
+      toIm: () => import('./pages/bootstrapIm').catch(onStartImportFailed).then(({bootstrapIm}) => bootstrapIm()),
+      openAccount: (accountNumber) => changeAccount(accountNumber)
+    });
   } else {
     console.log('Will mount IM page:', Date.now() / 1000);
 
@@ -615,7 +688,7 @@ function setDocumentLangPackProperties(langPack: LangPackDifference.langPackDiff
     fadeInWhenFontsReady(document.getElementById('main-columns'), fontsPromise);
 
     const [{bootstrapIm}, shouldAnimate] = await Promise.all([
-      import('./pages/bootstrapIm'),
+      import('./pages/bootstrapIm').catch(onStartImportFailed),
       sessionStorage.get('should_animate_main')
     ]);
 

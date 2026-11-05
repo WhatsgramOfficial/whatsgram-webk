@@ -1,4 +1,7 @@
 import type {PeerAvailableReactions} from '@appManagers/appReactionsManager';
+import Button from '@components/button';
+import Modes from '@config/modes';
+import {attachPickerGrid} from '@helpers/dom/attachListNavigation';
 import IS_TOUCH_SUPPORTED from '@environment/touchSupport';
 import {IS_MOBILE, IS_SAFARI} from '@environment/userAgent';
 import filterUnique from '@helpers/array/filterUnique';
@@ -6,6 +9,8 @@ import assumeType from '@helpers/assumeType';
 import callbackifyAll from '@helpers/callbackifyAll';
 import deferredPromise from '@helpers/cancellablePromise';
 import cancelEvent from '@helpers/dom/cancelEvent';
+import cloneDOMRect from '@helpers/dom/cloneDOMRect';
+import createFocusTrap from '@helpers/dom/focusTrap';
 import {attachClickEvent} from '@helpers/dom/clickEvent';
 import findUpClassName from '@helpers/dom/findUpClassName';
 import {getOverlayRoot} from '@helpers/appWindow';
@@ -15,7 +20,7 @@ import {Middleware, getMiddleware} from '@helpers/middleware';
 import noop from '@helpers/noop';
 import {fastRaf} from '@helpers/schedulers';
 import {Message, AvailableReaction, Reaction, AvailableEffect, EmojiGroup} from '@layer';
-import {AppManagers} from '@lib/managers';
+import {ReadingManagers} from '@lib/managers';
 import apiManagerProxy from '@lib/apiManagerProxy';
 import lottieLoader from '@lib/lottie/lottieLoader';
 import LottiePlayer from '@lib/lottie/lottiePlayer';
@@ -28,13 +33,13 @@ import EmojiTab from '@components/emoticonsDropdown/tabs/emoji';
 import wrapSticker from '@components/wrappers/sticker';
 import {i18n} from '@lib/langPack';
 import anchorCallback from '@helpers/dom/anchorCallback';
-import PopupPremium from '@components/popups/premium';
 import contextMenuController from '@helpers/contextMenuController';
 import callbackify from '@helpers/callbackify';
 import partition from '@helpers/array/partition';
 import {PAID_REACTION_EMOJI_DOCID} from '@lib/customEmoji/constants';
-import {StarsStar} from '@components/popups/stars';
+import {StarsStar} from '@components/stars/starsAmount';
 import {cleanEmoji} from '@lib/richTextProcessor/fixEmoji';
+import {hotReloadGuard} from '@lib/solidjs/hotReloadGuardProvider';
 
 const REACTIONS_CLASS_NAME = 'btn-menu-reactions';
 const REACTION_CLASS_NAME = REACTIONS_CLASS_NAME + '-reaction';
@@ -61,8 +66,9 @@ export class ChatReactionsMenu {
   // private scrollable: ScrollableBase;
   private animationGroup: AnimationItemGroup;
   private middlewareHelper: ReturnType<typeof getMiddleware>;
-  private managers: AppManagers;
+  private managers: ReadingManagers;
   private onFinish: (reaction?: Reaction | Promise<Reaction>) => void;
+  private onPick: (reaction: Reaction, source: HTMLElement) => void;
   private listenerSetter: ListenerSetter;
   private size: number;
   private openSide: 'top' | 'bottom';
@@ -70,35 +76,49 @@ export class ChatReactionsMenu {
   private noMoreButton: boolean;
   private isTags: boolean;
   private isEffects: boolean;
+  private night: boolean;
   private reactions: Reaction[];
   private availableReactions: AvailableReaction[];
   private noPacks: boolean;
   private noSearch: boolean;
   public freeCustomEmoji: Set<DocId>;
   public inited: boolean;
+  /** once the reactions are there, after `init` when they were not at hand */
+  public rendered: Promise<unknown>;
+  // * the whole choice while it stands open: mounted outside the strip, it outlives it
+  private expanded: EmoticonsDropdown;
 
   constructor(options: {
-    managers: AppManagers,
+    managers: ReadingManagers,
     type: 'horizontal' | 'vertical',
     middleware: Middleware,
     onFinish: ChatReactionsMenu['onFinish'],
+    /** a reaction chosen, by what shows it (a reaction of the strip, an emoji of the whole choice): before it goes */
+    onPick?: ChatReactionsMenu['onPick'],
     size?: ChatReactionsMenu['size'],
     openSide?: ChatReactionsMenu['openSide'],
-    getOpenPosition: ChatReactionsMenu['getOpenPosition'],
+    /** where the whole choice opens; over the strip, its reactions where the strip has them, if not given */
+    getOpenPosition?: ChatReactionsMenu['getOpenPosition'],
     noMoreButton?: boolean,
     isTags?: boolean,
-    isEffects?: boolean
+    isEffects?: boolean,
+    /** what choosing does, above the reactions — tags and effects have theirs */
+    description?: HTMLElement,
+    /** the whole choice dark, as over a story */
+    night?: boolean
   }) {
     this.managers = options.managers;
     this.middlewareHelper = options.middleware ? options.middleware.create() : getMiddleware();
     this.onFinish = options.onFinish;
+    this.onPick = options.onPick;
     this.listenerSetter = new ListenerSetter();
     this.size = options.size ?? REACTION_SIZE;
     this.openSide = options.openSide ?? 'bottom';
-    this.getOpenPosition = options.getOpenPosition;
+    this.getOpenPosition = options.getOpenPosition ?? this.getOpenPositionOverStrip;
     this.noMoreButton = options.noMoreButton;
     this.isTags = options.isTags;
     this.isEffects = options.isEffects;
+    this.night = options.night;
 
     this.middlewareHelper.get().onDestroy(() => {
       this.listenerSetter.removeAll();
@@ -111,23 +131,28 @@ export class ChatReactionsMenu {
       'btn-menu-transition'
     );
 
-    if(this.isTags || this.isEffects) {
+    if(this.isTags || this.isEffects || options.description) {
       widthContainer.classList.add(REACTIONS_CLASS_NAME + '-container-' + 'tags');
-      const description = this.isEffects ? i18n('AddEffectMessageHint') : i18n(
+      const description = options.description || (this.isEffects ? i18n('AddEffectMessageHint') : i18n(
         rootScope.premium ? 'Reactions.Tag.Description' : 'Reactions.Tag.PremiumHint',
         [
           anchorCallback(() => {
             contextMenuController.close();
-            PopupPremium.show({feature: 'saved_tags'});
+            hotReloadGuard.showPremiumPopup({feature: 'saved_tags'});
           })
         ]
-      );
+      ));
       description.classList.add(REACTIONS_CLASS_NAME + '-description');
       widthContainer.append(description);
     }
 
     const reactionsContainer = this.container = document.createElement('div');
     reactionsContainer.classList.add(REACTIONS_CLASS_NAME/* , 'btn-menu-transition' */);
+    this.middlewareHelper.get().onDestroy(attachPickerGrid(
+      reactionsContainer,
+      `.${REACTION_CLASS_NAME}`,
+      (element) => element.getAttribute('aria-label')
+    ));
 
     // const shadow = document.createElement('div');
     // shadow.classList.add('inner-shadow');
@@ -168,6 +193,7 @@ export class ChatReactionsMenu {
       if(!this.isEffects) {
         stashFlightSource(players.reaction, reactionDiv);
       }
+      this.onPick?.(players.reaction, reactionDiv);
       this.onFinish(players.reaction);
     }, {listenerSetter: this.listenerSetter});
 
@@ -182,7 +208,7 @@ export class ChatReactionsMenu {
     }
 
     if(hasMore && !this.noMoreButton) {
-      const moreButton = ButtonIcon(`${this.openSide === 'bottom' ? 'down' : 'up'} ${REACTIONS_CLASS_NAME}-more`, {noRipple: true});
+      const moreButton = ButtonIcon(`${this.openSide === 'bottom' ? 'down' : 'up'} ${REACTIONS_CLASS_NAME}-more`, {noRipple: true, ariaLabel: 'MultiAccount.More'});
       this.container.append(moreButton);
       attachClickEvent(
         moreButton,
@@ -293,6 +319,7 @@ export class ChatReactionsMenu {
       [cached, renderPromise] = await this.prepareReactions(message);
     }
 
+    this.rendered = renderPromise;
     if(cached) {
       await renderPromise;
     }
@@ -311,6 +338,19 @@ export class ChatReactionsMenu {
 
     this.inited = true;
   }
+
+  /** closes the whole choice if it stands open: for a host that goes while it does (the stories viewer) */
+  public closeExpanded() {
+    this.expanded?.hideAndDestroy();
+  }
+
+  private getOpenPositionOverStrip = (hasMenu: boolean) => {
+    const newRect = cloneDOMRect(this.container.getBoundingClientRect());
+    newRect.left -= 21 / 2;
+    newRect.top -= 121 / 2;
+    if(!hasMenu) newRect.top += 37;
+    return newRect;
+  };
 
   public cleanup() {
     this.middlewareHelper.clean();
@@ -392,6 +432,13 @@ export class ChatReactionsMenu {
       noSearch: this.noSearch,
       managers: this.managers,
       mainSets: this.isTags ? this.loadTags : (this.isEffects ? this.loadEffects : this.loadReactions),
+      // * the recent reactions can be cleared from the picker, as in Web A, iOS and Android; the top
+      // * reactions past the first row stay in their place
+      clearRecent: this.isTags || this.isEffects ? undefined : {
+        titleLangKey: 'ClearRecentReactionsAlertTitle',
+        descriptionLangKey: 'ClearRecentReactionsAlertMessage',
+        clear: (managers) => managers.appReactionsManager.clearRecentReactions().then(() => this.loadReactions()[1])
+      },
       additionalLocalStickerSet: this.isEffects ? async() => {
         const availableEffects = await this.managers.appReactionsManager.getAvailableEffects();
         return (await this.splitAvailableEffects(availableEffects)).localStickerSet;
@@ -427,6 +474,7 @@ export class ChatReactionsMenu {
           stashFlightSource(reaction, emoji.element);
         }
 
+        this.onPick?.(reaction, emoji.element);
         deferred.resolve(reaction);
         emoticonsDropdown.hideAndDestroy();
       },
@@ -465,13 +513,16 @@ export class ChatReactionsMenu {
       showLocks: this.isEffects
     });
 
+    // * where the strip stands as More is pressed: what waits for the pick may take the strip away meanwhile (a
+    // * story's strip gives way to the one over its reply field)
+    const openPosition = this.getOpenPosition(!this.noPacks);
     const emoticonsDropdown = new EmoticonsDropdown({
       tabsToRender: [emojiTab],
       // Mount into the active app window's body (a function so it resolves lazily at open time):
       // while the client is popped into a Document PiP window the reactions menu lives there, so a
       // hardcoded main-`document.body` would render this emoji picker into the now-background tab.
       customParentElement: getOverlayRoot,
-      getOpenPosition: () => this.getOpenPosition(!this.noPacks)
+      getOpenPosition: () => openPosition
     });
 
     if(canShrink) {
@@ -482,17 +533,36 @@ export class ChatReactionsMenu {
       emoticonsDropdown.getElement().classList.add('smaller');
     }
 
+    if(this.night) {
+      emoticonsDropdown.getElement().classList.add('night');
+      emoticonsDropdown.setTextColor('white');
+    }
+
+    // * with the keyboard layer the whole choice takes the focus while it is open, over any trap around the
+    // * strip, and gives it back to where it was as it goes
+    const focusTrap = createFocusTrap(emoticonsDropdown.getElement());
+    emoticonsDropdown.addEventListener('opened', () => focusTrap.activate(), {once: true});
+
     const deferred = deferredPromise<Reaction>();
+    this.expanded = emoticonsDropdown;
     this.onFinish(deferred);
-    emoticonsDropdown.addEventListener('closed', () => {
+    // * on its way out, however it goes: a pick destroys it before it is closed, and the trap, the pick
+    // * waited for and the handle to it must not outlive it
+    emoticonsDropdown.addEventListener('close', () => {
+      if(this.expanded === emoticonsDropdown) this.expanded = undefined;
+      focusTrap.deactivate();
       deferred.resolve(undefined);
+    });
+    emoticonsDropdown.addEventListener('closed', () => {
       emoticonsDropdown.hideAndDestroy();
     });
 
     emoticonsDropdown.onButtonClick();
   };
 
-  private async splitAvailableEffects(availableEffects: AvailableEffect[]): ReturnType<EmojiTab['searchFetcher']> {
+  private async splitAvailableEffects(
+    availableEffects: AvailableEffect[]
+  ): Promise<Awaited<ReturnType<EmojiTab['searchFetcher']>>> {
     const [stickers, customEmojis] = partition(availableEffects, (availableEffect) => !availableEffect.effect_animation_id);
     const docIds = stickers.map((availableEffect) => availableEffect.effect_sticker_id);
     const docs = await Promise.all(docIds.map((docId) => this.managers.appDocsManager.getDoc(docId)));
@@ -519,10 +589,18 @@ export class ChatReactionsMenu {
       warmUpReactionEffect(availableReaction);
     }
 
-    const reactionDiv = document.createElement('div');
-    reactionDiv.classList.add(REACTION_CLASS_NAME);
+    // a native button only with the keyboard layer: it takes the focus on click
+    const reactionDiv = Button(REACTION_CLASS_NAME, {
+      noRipple: true,
+      ariaLabel: reaction._ === 'reactionPaid' ? 'StarsReactionTitle' : 'Reactions',
+      asDiv: !Modes.a11y
+    });
+    if(availableReaction?.title || reaction._ === 'reactionEmoji') {
+      reactionDiv.setAttribute('aria-label', availableReaction?.title || (reaction as Reaction.reactionEmoji).emoticon);
+    }
 
     const scaleContainer = document.createElement('div');
+    scaleContainer.setAttribute('aria-hidden', 'true');
     scaleContainer.classList.add(REACTION_CLASS_NAME + '-scale');
 
     const appearWrapper = document.createElement('div');
@@ -603,6 +681,7 @@ export class ChatReactionsMenu {
       delete options.withThumb;
 
       const wrap = () => {
+        if(doc?.stickerEmojiRaw) reactionDiv.setAttribute('aria-label', doc.stickerEmojiRaw);
         wrapSticker({
           doc,
           div: appearWrapper,

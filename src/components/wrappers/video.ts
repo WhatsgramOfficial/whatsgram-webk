@@ -4,6 +4,7 @@ import {animateSingle} from '@helpers/animation';
 import deferredPromise, {CancellablePromise} from '@helpers/cancellablePromise';
 import cancelEvent from '@helpers/dom/cancelEvent';
 import {attachClickEvent} from '@helpers/dom/clickEvent';
+import {hasMediaSpoiler} from '@components/wrappers/mediaSpoiler';
 import createVideo from '@helpers/dom/createVideo';
 import handleVideoLeak from '@helpers/dom/handleVideoLeak';
 import isInDOM from '@helpers/dom/isInDOM';
@@ -24,15 +25,15 @@ import toHHMMSS from '@helpers/string/toHHMMSS';
 import {Message, PhotoSize, VideoSize} from '@layer';
 import {MyDocument} from '@appManagers/appDocsManager';
 import appDownloadManager from '@lib/appDownloadManager';
-import appImManager from '@lib/appImManager';
-import {AppManagers} from '@lib/managers';
+import {ReadingManagers} from '@lib/managers';
 import {NULL_PEER_ID} from '@appManagers/constants';
 import apiManagerProxy from '@lib/apiManagerProxy';
+import getDocumentURL from '@appManagers/utils/docs/getDocumentURL';
 import rootScope from '@lib/rootScope';
 import {ThumbCache} from '@lib/storages/thumbs';
 import animationIntersector, {AnimationItemGroup} from '@components/animationIntersector';
 import appMediaPlaybackController, {AppMediaPlaybackController, MediaSearchContext} from '@components/appMediaPlaybackController';
-import AudioElement, {findMediaTargets} from '@components/audio';
+import {DeferredMediaElement, findMediaTargets} from '@components/audio';
 import Button from '@components/button';
 import Icon from '@components/icon';
 import {createProgressRing, getProgressRingCircumference} from '@components/progressRing';
@@ -43,15 +44,16 @@ import SuperIntersectionObserver, {IntersectionCallback} from '@helpers/dom/supe
 import VideoPlayer from '@lib/mediaPlayer';
 import debounce from '@helpers/schedulers/debounce';
 import {isFullScreen} from '@helpers/dom/fullScreen';
-import ButtonIcon from '@components/buttonIcon';
 import overlayCounter from '@helpers/overlayCounter';
 import {ChatAutoDownloadSettings} from '@hooks/useAutoDownloadSettings';
+import {hotReloadGuard} from '@lib/solidjs/hotReloadGuardProvider';
+import {hotListen} from '@helpers/hotModule';
 
 const MAX_VIDEO_AUTOPLAY_SIZE = 50 * 1024 * 1024; // 50 MB
 export const USE_VIDEO_OBSERVER = false;
 
 const roundVideoProgressRingResizers = new Set<() => void>();
-mediaSizes.addEventListener('changeScreen', (from, to) => {
+hotListen(import.meta.hot, mediaSizes, 'changeScreen', (from: ScreenSize, to: ScreenSize) => {
   if(to === ScreenSize.mobile || from === ScreenSize.mobile) {
     roundVideoProgressRingResizers.forEach((resize) => resize());
   }
@@ -61,13 +63,14 @@ mediaSizes.addEventListener('changeScreen', (from, to) => {
 
 let turnedObserverOn = false;
 
-export default async function wrapVideo({doc, altDoc, container, message, boxWidth, boxHeight, withTail, isOut, middleware, lazyLoadQueue, noInfo, group, onlyPreview, noPreview, withoutPreloader, loadPromises, noPlayButton, photoSize, videoSize, searchContext, autoDownload, managers = rootScope.managers, noAutoplayAttribute, ignoreStreaming, canAutoplay, useBlur, observer, setShowControlsOn, uploadingFileName, onGlobalMedia, onLoad, withPreview}: {
+export default async function wrapVideo({doc, altDoc, container, message, boxWidth, boxHeight, fillBox, withTail, isOut, middleware, lazyLoadQueue, noInfo, group, onlyPreview, noPreview, withoutPreloader, loadPromises, noPlayButton, photoSize, videoSize, searchContext, autoDownload, managers = rootScope.managers, noAutoplayAttribute, ignoreStreaming, canAutoplay, useBlur, observer, setShowControlsOn, uploadingFileName, onGlobalMedia, onLoad, withPreview, hlsStreaming, streamablePreloader}: {
   doc: MyDocument,
   altDoc?: MyDocument,
   container?: HTMLElement,
   message?: Message.message,
   boxWidth?: number,
   boxHeight?: number,
+  fillBox?: boolean,
   withTail?: boolean,
   isOut?: boolean,
   middleware: Middleware,
@@ -84,7 +87,7 @@ export default async function wrapVideo({doc, altDoc, container, message, boxWid
   photoSize?: PhotoSize,
   videoSize?: Extract<VideoSize, VideoSize.videoSize>,
   searchContext?: MediaSearchContext,
-  managers?: AppManagers,
+  managers?: ReadingManagers,
   noAutoplayAttribute?: boolean,
   ignoreStreaming?: boolean,
   canAutoplay?: boolean,
@@ -93,7 +96,11 @@ export default async function wrapVideo({doc, altDoc, container, message, boxWid
   setShowControlsOn?: HTMLElement,
   uploadingFileName?: string,
   onGlobalMedia?: (media: HTMLMediaElement) => void,
-  onLoad?: () => void
+  onLoad?: () => void,
+  // * stream its quality ladder over HLS instead of the one file, as the media viewer does
+  hlsStreaming?: boolean,
+  // * a stream shows the media viewer's loader (the ring with a square), not the chat's spinner
+  streamablePreloader?: boolean
 }) {
   const supportsStreaming = doc.supportsStreaming && !ignoreStreaming;
   if(!supportsStreaming && altDoc && !onlyPreview && !IS_H265_SUPPORTED) {
@@ -110,6 +117,9 @@ export default async function wrapVideo({doc, altDoc, container, message, boxWid
   let noAutoDownload = autoDownloadSize === 0;
   const isGroupedItem = !(boxWidth && boxHeight);
   uploadingFileName ??= message?.uploadingFileName?.[0];
+  // * a round video keeps looping its muted preview while it uploads, like the official clients do;
+  // * a regular video would just play under the progress spinner, so it waits for the upload instead
+  const suppressAutoplayWhileUploading = !!uploadingFileName && doc.type !== 'round';
   canAutoplay ??= /* doc.sticker ||  */(
     (
       doc.type !== 'video' || (
@@ -120,7 +130,7 @@ export default async function wrapVideo({doc, altDoc, container, message, boxWid
   );
   let spanTime: HTMLElement, spanPlay: HTMLElement;
 
-  let willObserveSound = false, noSoundIcon: HTMLElement, myMiddlewareHelper: MiddlewareHelper, originalMiddleware: Middleware;
+  let willObserveSound = false, myMiddlewareHelper: MiddlewareHelper, originalMiddleware: Middleware;
   if(!noInfo && container) {
     spanTime = document.createElement('span');
     spanTime.classList.add('video-time');
@@ -140,7 +150,7 @@ export default async function wrapVideo({doc, altDoc, container, message, boxWid
             middleware = myMiddlewareHelper.get();
           }
 
-          spanTime.append(noSoundIcon = Icon('nosound', 'video-time-icon'));
+          spanTime.append(Icon('nosound_filled', 'video-time-icon'));
         } else {
           needPlayButton = true;
         }
@@ -155,7 +165,7 @@ export default async function wrapVideo({doc, altDoc, container, message, boxWid
     }
 
     if(needPlayButton) {
-      spanPlay = Button('btn-circle video-play position-center', {icon: 'largeplay', noRipple: true});
+      spanPlay = Button('btn-circle video-play position-center', {icon: 'largeplay_filled', noRipple: true});
       container.append(spanPlay);
     }
   }
@@ -173,6 +183,7 @@ export default async function wrapVideo({doc, altDoc, container, message, boxWid
       container,
       boxWidth,
       boxHeight,
+      fillBox,
       withTail,
       isOut,
       lazyLoadQueue,
@@ -263,7 +274,7 @@ export default async function wrapVideo({doc, altDoc, container, message, boxWid
       }) as HTMLVideoElement;
       onGlobalMedia?.(globalVideo);
       const clear = () => {
-        (appImManager.chat.setPeerPromise || Promise.resolve()).finally(() => {
+        (hotReloadGuard.appImManager.chat.setPeerPromise || Promise.resolve()).finally(() => {
           if(isInDOM(globalVideo)) {
             return;
           }
@@ -304,7 +315,7 @@ export default async function wrapVideo({doc, altDoc, container, message, boxWid
         fastRaf(onTimeUpdate);
       }, 1000, false);
 
-      const noSoundIcon = Icon('nosound', 'video-time-icon');
+      const noSoundIcon = Icon('nosound_filled', 'video-time-icon');
       const setIsPaused = (paused: boolean) => {
         divRound.classList.toggle('is-paused', paused);
         if(paused) {
@@ -395,12 +406,12 @@ export default async function wrapVideo({doc, altDoc, container, message, boxWid
 
     if(message.pFlags.is_outgoing) {
       // ! WARNING ! just to type-check
-      (divRound as any as AudioElement).onLoad = onLoad;
+      (divRound as any as DeferredMediaElement).onLoad = onLoad;
       divRound.dataset.isOutgoing = '1';
     } else {
       onLoad();
     }
-  } else if(!noAutoplayAttribute && !uploadingFileName) {
+  } else if(!noAutoplayAttribute && !suppressAutoplayWhileUploading) {
     video.autoplay = true; // для safari
   }
 
@@ -412,6 +423,7 @@ export default async function wrapVideo({doc, altDoc, container, message, boxWid
       container,
       boxWidth,
       boxHeight,
+      fillBox,
       withTail,
       isOut,
       lazyLoadQueue,
@@ -508,10 +520,11 @@ export default async function wrapVideo({doc, altDoc, container, message, boxWid
 
     // * autoplay is suppressed while the upload is in progress, and the bubble
     // * isn't re-rendered on send — resume playback once the upload completes
-    if(!noAutoplayAttribute && doc.type !== 'round') {
+    if(!noAutoplayAttribute && suppressAutoplayWhileUploading) {
       appDownloadManager.getUpload(uploadingFileName).then(() => {
         if(middleware && !middleware()) return;
-        video.play().catch(noop);
+        video.autoplay = true; // * so the intersector resumes it after it scrolls back into view
+        safePlay(video);
       }, noop);
     }
   } else if(!cacheContext.downloaded && !supportsStreaming && !withoutPreloader) {
@@ -521,6 +534,7 @@ export default async function wrapVideo({doc, altDoc, container, message, boxWid
   } else if(supportsStreaming && !withoutPreloader) {
     preloader = new ProgressivePreloader({
       cancelable: false,
+      streamable: streamablePreloader,
       attachMethod: 'prepend'
     });
   }
@@ -571,232 +585,18 @@ export default async function wrapVideo({doc, altDoc, container, message, boxWid
   video.muted = true;
   video.loop = true;
   // video.play();
-  if(!noAutoplayAttribute && !uploadingFileName) {
+  if(!noAutoplayAttribute && !suppressAutoplayWhileUploading) {
     video.autoplay = true;
   }
 
-  let loadPhotoThumbFunc = noAutoDownload && photoRes?.preloader?.loadFunc;
-  const load = async() => {
-    if(preloader && noAutoDownload && !withoutPreloader) {
-      preloader.construct();
-      preloader.setManual();
-    }
-
-    getCacheContext();
-    let loadPromise: Promise<any> = Promise.resolve();
-    if((preloader && !uploadingFileName) || withoutPreloader) {
-      if(!cacheContext.downloaded && !supportsStreaming) {
-        const promise = loadPromise = appDownloadManager.downloadMediaURL({
-          media: doc,
-          queueId: lazyLoadQueue?.queueId,
-          onlyCache: noAutoDownload,
-          thumb: videoSize
-        });
-
-        if(preloader) {
-          preloader.attach(container, false, promise);
-        }
-      } else if(supportsStreaming) {
-        if(noAutoDownload) {
-          loadPromise = Promise.reject(makeError('NO_AUTO_DOWNLOAD'));
-        } else if(!cacheContext.downloaded && preloader) { // * check for uploading video
-          preloader.attach(container, false, null);
-          video.addEventListener(IS_SAFARI ? 'timeupdate' : 'canplay', () => {
-            preloader.detach();
-          }, {once: true});
-        }
-      }
-    }
-
-    if(!noAutoDownload && loadPhotoThumbFunc) {
-      loadPhotoThumbFunc();
-      loadPhotoThumbFunc = null;
-    }
-
-    noAutoDownload = undefined;
-
-    loadPromise.then(async() => {
-      if(middleware && !middleware()) {
-        renderDeferred.resolve();
-        return;
-      }
-
-      if(doc.type === 'round') {
-        appMediaPlaybackController.resolveWaitingForLoadMedia(message.peerId, message.mid, message.pFlags.is_scheduled);
-      }
-
-      getCacheContext();
-
-      const onError = (err: any) => {
-        console.error('video load error', video, err);
-        if(spanTime) {
-          spanTime.classList.add('is-error');
-          const previousIcon = spanTime.querySelector('.video-time-icon');
-          const newIcon = Icon('sendingerror', 'video-time-icon');
-          if(previousIcon) previousIcon.replaceWith(newIcon);
-          else spanTime.append(newIcon);
-        }
-        renderDeferred.reject(err);
-      };
-      const onMediaLoadPromise = onMediaLoad(video);
-      const videoLeakPromise = handleVideoLeak(video, onMediaLoadPromise);
-      videoLeakPromise.catch(onError);
-      onMediaLoadPromise.then(() => {
-        if(group) {
-          animationIntersector.addAnimation({
-            animation: video,
-            group,
-            observeElement: video,
-            type: 'video',
-            locked: willObserveSound
-          });
-        }
-
-        if(preloader && !uploadingFileName) {
-          preloader.detach();
-        }
-
-        if(!video.parentElement && container && !video.poster/*  && !altDoc */) {
-          appendVideo();
-        }
-
-        if(altDoc) {
-          videoLeakPromise.then(() => {
-            video.pause();
-            renderDeferred.resolve();
-          });
-          setCurrentTime(video, 0.0001);
-        } else {
-          renderDeferred.resolve();
-        }
-
-        onLoad?.();
-        attachSoundObserver?.();
-      }, onError);
-
-      if(altDoc && altCacheContext) {
-        const sources = [
-          {context: cacheContext, type: 'video/mp4; codecs="hev1"', width: doc.w},
-          {context: altCacheContext, type: 'video/mp4; codecs="avc1.64001E"', width: altDoc.w}
-        ].map(({context, type, width}) => {
-          const source = document.createElement('source');
-          source.src = context.url;
-          // source.type = type;
-          source.width = width;
-          return source;
-        });
-
-        video.append(...sources);
-        video.load();
-      } else {
-        renderImageFromUrl(video, cacheContext.url);
-      }
-    }, noop);
-
-    return {download: loadPromise, render: Promise.all([loadPromise, renderDeferred])};
-  };
-
-  if(preloader && !uploadingFileName) {
-    preloader.setDownloadFunction(load);
-  }
-
-  container && ((container as any).preloader = preloader);
-
-  if(doc.type === 'gif' && !canAutoplay) {
-    attachClickEvent(container, (e) => {
-      cancelEvent(e);
-      spanPlay?.remove();
-      load();
-    }, {capture: true, once: true});
-  } else {
-    res.loadPromise = !lazyLoadQueue ?
-      (await load()).render :
-      (lazyLoadQueue.push({div: container, load: () => load().then(({render}) => render)}), Promise.resolve());
-  }
-
-  if(res.thumb) {
-    await res.thumb.loadPromises.thumb;
-  }
-
-  if(video) {
-    res.video = video;
-  }
-
+  // * before `load`, which calls this once the video has loaded: a video from the cache loads while
+  // * the thumb is still awaited below, and found it not yet made
   const attachSoundObserver = willObserveSound ? () => {
     video.mini = true;
     video.pause();
-    // const button = ButtonIcon('zoomin video-to-viewer', {noRipple: true});
-    // container.append(button);
-
-    // const updateIcon = (muted: boolean) => {
-    //   replaceButtonIcon(button, muted ? 'speakeroff' : 'speaker');
-    // };
-
-    // updateIcon(video.muted);
-
-    const onMuted = () => {
-      return;
-
-      releaseSingleMedia?.(true);
-      releaseSingleMedia = undefined;
-      // video.muted = true;
-    };
-
-    const onUnmute = () => {
-      return;
-
-      // if(onAnotherSingleMedia !== _onAnotherSingleMedia) {
-      //   onAnotherSingleMedia?.();
-      // }
-
-      releaseSingleMedia = appMediaPlaybackController.setSingleMedia({
-        media: video,
-        message,
-        standalone: true
-      });
-      // onAnotherSingleMedia = _onAnotherSingleMedia = () => {
-      //   mute();
-      // };
-    };
-
-    const mute = () => {
-      if(!releaseSingleMedia) {
-        return;
-      }
-
-      noSoundIcon.classList.remove('hide');
-      onMuted();
-    };
-
-    const unmute = () => {
-      if(releaseSingleMedia) {
-        return;
-      }
-
-      noSoundIcon.classList.add('hide');
-      onUnmute();
-    };
-
-    // const toggle = (_unmute?: boolean) => {
-    //   if(_unmute !== undefined) (_unmute ? unmute : mute)();
-    //   else (releaseSingleMedia ? mute : unmute)();
-    //   updateIcon(video.muted);
-    // };
-
-    let releaseSingleMedia: ReturnType<AppMediaPlaybackController['setSingleMedia']>/* , _onAnotherSingleMedia: () => void */;
-    // const detachClickEvent = attachClickEvent(button, (e) => {
-    //   cancelEvent(e);
-    //   toggle();
-    // });
-
     const onIntersection: IntersectionCallback = (entry) => {
       if(!entry.isIntersecting) {
         destroyPlayer();
-      }
-
-      if(!entry.isIntersecting && !video.muted) {
-        // toggle(false);
-        onMuted();
       }
     };
 
@@ -866,7 +666,6 @@ export default async function wrapVideo({doc, altDoc, container, message, boxWid
           }
 
           // changedVolume = true;
-          // (!video.volume || video.muted ? mute : unmute)();
         },
         onFullScreen: (active) => {
           onLock(active);
@@ -901,18 +700,7 @@ export default async function wrapVideo({doc, altDoc, container, message, boxWid
         return;
       }
 
-      video.muted = appMediaPlaybackController.muted;
-      video.volume = Math.min(appMediaPlaybackController.volume, 1);
-    };
-
-    const onSingleMedia = (media: HTMLMediaElement) => {
-      if(media !== video && !video.muted) {
-        if(videoPlayer) {
-          videoPlayer.volumeSelector.setVolume({muted: true, volume: video.volume});
-        } else {
-          video.muted = true;
-        }
-      }
+      appMediaPlaybackController.applySharedVolume(video);
     };
 
     const onPlaybackMediaParams = (params: ReturnType<AppMediaPlaybackController['getPlaybackParams']>) => {
@@ -920,22 +708,18 @@ export default async function wrapVideo({doc, altDoc, container, message, boxWid
         return;
       }
 
+      appMediaPlaybackController.applySharedVolume(video);
       video.muted = turnedObserverOn ? params.muted : true;
       video.playbackRate = params.playbackRate;
-      video.volume = Math.min(params.volume, 1);
     };
 
     appMediaPlaybackController.addEventListener('toggleVideoAutoplaySound', onAutoplaySound);
-    // appMediaPlaybackController.addEventListener('singleMedia', onSingleMedia);
     appMediaPlaybackController.addEventListener('playbackParams', onPlaybackMediaParams);
 
     middleware.onClean(() => {
-      // detachClickEvent();
-      releaseSingleMedia?.();
       observer.unobserve(video, onIntersection);
       delete container.onMiniVideoMouseMove;
       appMediaPlaybackController.removeEventListener('toggleVideoAutoplaySound', onAutoplaySound);
-      // appMediaPlaybackController.removeEventListener('singleMedia', onSingleMedia);
       appMediaPlaybackController.removeEventListener('playbackParams', onPlaybackMediaParams);
     });
 
@@ -944,6 +728,159 @@ export default async function wrapVideo({doc, altDoc, container, message, boxWid
       myMiddlewareHelper.destroy();
     });
   } : undefined;
+
+  let loadPhotoThumbFunc = noAutoDownload && photoRes?.preloader?.loadFunc;
+  const load = async() => {
+    if(preloader && noAutoDownload && !withoutPreloader) {
+      preloader.construct();
+      preloader.setManual();
+    }
+
+    getCacheContext();
+    let loadPromise: Promise<any> = Promise.resolve();
+    if((preloader && !uploadingFileName) || withoutPreloader) {
+      if(!cacheContext.downloaded && !supportsStreaming) {
+        const promise = loadPromise = appDownloadManager.downloadMediaURL({
+          media: doc,
+          queueId: lazyLoadQueue?.queueId,
+          onlyCache: noAutoDownload,
+          thumb: videoSize
+        });
+
+        if(preloader) {
+          preloader.attach(container, false, promise);
+        }
+      } else if(supportsStreaming) {
+        if(noAutoDownload) {
+          loadPromise = Promise.reject(makeError('NO_AUTO_DOWNLOAD'));
+        } else if(!cacheContext.downloaded && preloader) { // * check for uploading video
+          preloader.attach(container, false, null);
+          video.addEventListener(IS_SAFARI ? 'timeupdate' : 'canplay', () => {
+            preloader.detach();
+          }, {once: true});
+        }
+      }
+    }
+
+    if(!noAutoDownload && loadPhotoThumbFunc) {
+      loadPhotoThumbFunc();
+      loadPhotoThumbFunc = null;
+    }
+
+    noAutoDownload = undefined;
+
+    loadPromise.then(async() => {
+      if(middleware && !middleware()) {
+        renderDeferred.resolve();
+        return;
+      }
+
+      if(doc.type === 'round') {
+        appMediaPlaybackController.resolveWaitingForLoadMedia(message.peerId, message.mid, message.pFlags.is_scheduled);
+      }
+
+      getCacheContext();
+
+      const onError = (err: any) => {
+        console.error('video load error', video, err);
+        if(spanTime) {
+          spanTime.classList.add('is-error');
+          const previousIcon = spanTime.querySelector('.video-time-icon');
+          const newIcon = Icon('sendingerror_filled', 'video-time-icon');
+          if(previousIcon) previousIcon.replaceWith(newIcon);
+          else spanTime.append(newIcon);
+        }
+        renderDeferred.reject(err);
+      };
+      const onMediaLoadPromise = onMediaLoad(video);
+      const videoLeakPromise = handleVideoLeak(video, onMediaLoadPromise);
+      videoLeakPromise.catch(onError);
+      onMediaLoadPromise.then(() => {
+        if(group) {
+          animationIntersector.addAnimation({
+            animation: video,
+            group,
+            observeElement: video,
+            type: 'video',
+            locked: willObserveSound
+          });
+        }
+
+        if(preloader && !uploadingFileName) {
+          preloader.detach();
+        }
+
+        if(!video.parentElement && container && !video.poster/*  && !altDoc */) {
+          appendVideo();
+        }
+
+        if(altDoc) {
+          videoLeakPromise.then(() => {
+            video.pause();
+            renderDeferred.resolve();
+          });
+          setCurrentTime(video, 0.0001);
+        } else {
+          renderDeferred.resolve();
+        }
+
+        onLoad?.();
+        attachSoundObserver?.();
+      }, onError);
+
+      if(altDoc && altCacheContext) {
+        const sources = [
+          {context: cacheContext, type: 'video/mp4; codecs="hev1"', width: doc.w},
+          {context: altCacheContext, type: 'video/mp4; codecs="avc1.64001E"', width: altDoc.w}
+        ].map(({context, type, width}) => {
+          const source = document.createElement('source');
+          source.src = context.url;
+          // source.type = type;
+          source.width = width;
+          return source;
+        });
+
+        video.append(...sources);
+        video.load();
+      } else {
+        // * an `hls/` source is played by hls.js, see createVideo
+        renderImageFromUrl(video, hlsStreaming && supportsStreaming ? getDocumentURL(doc, {supportsHlsStreaming: true}) : cacheContext.url);
+      }
+    }, noop);
+
+    return {download: loadPromise, render: Promise.all([loadPromise, renderDeferred])};
+  };
+
+  if(preloader && !uploadingFileName) {
+    preloader.setDownloadFunction(load);
+  }
+
+  container && ((container as any).preloader = preloader);
+
+  if(doc.type === 'gif' && !canAutoplay) {
+    const detach = attachClickEvent(container, (e) => {
+      // * one under a spoiler is revealed first, by its owner's click
+      if(hasMediaSpoiler(container)) return;
+      detach();
+      cancelEvent(e);
+      spanPlay?.remove();
+      // * asked for by this click: it plays once loaded, the one that waited under a spoiler too
+      video.autoplay = true;
+      load();
+    }, {capture: true});
+  } else {
+    res.loadPromise = !lazyLoadQueue ?
+      (await load()).render :
+      (lazyLoadQueue.push({div: container, load: () => load().then(({render}) => render)}), Promise.resolve());
+  }
+
+  if(res.thumb) {
+    await res.thumb.loadPromises.thumb;
+  }
+
+  if(video) {
+    res.video = video;
+  }
 
   return res;
 }

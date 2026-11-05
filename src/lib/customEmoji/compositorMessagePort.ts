@@ -1,5 +1,6 @@
 import SuperMessagePort from '@lib/superMessagePort';
 import {MOUNT_CLASS_TO} from '@config/debug';
+import type {ThreadMemoryStats} from '@lib/debug/memoryStats';
 
 export type EmojiCompositorMethods = {
   attachRenderer: (p: {rendererId: number, canvas: OffscreenCanvas, dpr: number, fadeEnabled: boolean}) => void, // [canvas] in transfer; the initial color arrives via the immediately-following configRenderer
@@ -7,7 +8,7 @@ export type EmojiCompositorMethods = {
   resizeRenderer: (p: {rendererId: number, width: number, height: number}) => void,
   configRenderer: (p: {rendererId: number} & Partial<{color: string, fadeEnabled: boolean, dpr: number}>) => void,
   attachGroup: (p: {rendererId: number, groupId: DocId, playerReqId: number, textColored: boolean, skipFade: boolean}) => void,
-  detachGroup: (p: {rendererId: number, groupId: DocId}) => void,
+  detachPlayer: (p: {playerReqId: number}) => void, // gone for good: every renderer's groups drawing it go
   resetFade: (p: {rendererId: number, groupId: DocId}) => void,
   setOffsets: (p: {batch: {rendererId: number, groups: {groupId: DocId, offsets: number[]}[]}[]}) => void, // [top,left,width] triples, pre-dpr
   clearRenderer: (p: {rendererId: number}) => void,
@@ -22,7 +23,9 @@ export type EmojiCompositorMethods = {
   configSticker: (p: {reqId: number, color?: string}) => void,
   presentSticker: (p: {reqId: number}) => void, // re-blit the latest frame (no-blink ensurePresented / nudgePresent)
 
-  decodePort: (p: {workerId: number}, source: MessageEventSource, event: MessageEvent) => void // MessagePort arrives in event.ports[0]
+  decodePort: (p: {workerId: number}, source: MessageEventSource, event: MessageEvent) => void, // MessagePort arrives in event.ports[0]
+
+  memoryStats: (p: void) => ThreadMemoryStats // see @lib/debug/memoryStats
 };
 
 export type EmojiCompositorEvents = {

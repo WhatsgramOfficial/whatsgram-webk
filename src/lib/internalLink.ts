@@ -28,8 +28,12 @@ export enum INTERNAL_LINK_TYPE {
   NEW,
   SETTINGS,
   CONTACTS,
+  CHATS,
   CONFERENCE_CALL,
-  ADD_AI_STYLE
+  ADD_AI_STYLE,
+  CONTACT_TOKEN,
+  WALLET_SEND,
+  TON_CONNECT
 };
 
 export type InternalLink =
@@ -58,8 +62,12 @@ export type InternalLink =
   InternalLink.InternalLinkNew |
   InternalLink.InternalLinkSettings |
   InternalLink.InternalLinkContacts |
+  InternalLink.InternalLinkChats |
   InternalLink.InternalLinkConferenceCall |
-  InternalLink.InternalLinkAddAiStyle;
+  InternalLink.InternalLinkAddAiStyle |
+  InternalLink.InternalLinkContactToken |
+  InternalLink.InternalLinkWalletSend |
+  InternalLink.InternalLinkTonConnect;
 
 export namespace InternalLink {
   export interface InternalLinkMessage {
@@ -74,8 +82,9 @@ export namespace InternalLink {
     admin?: string,
     option?: string,
     t?: string, // media timestamp
-    single?: string,
+    single?: string, // present (empty) when the link is to this one item of an album, not to the whole album
     text?: string,
+    game?: string, // a bot's game, by its short name, to share to a chat
     stack?: ChatSetPeerOptions['stack'] // local
   }
 
@@ -87,6 +96,7 @@ export namespace InternalLink {
     comment?: string,
     option?: string,
     t?: string // media timestamp
+    single?: string, // see InternalLinkMessage
     stack?: ChatSetPeerOptions['stack'] // local
   }
 
@@ -178,6 +188,30 @@ export namespace InternalLink {
     slug: string
   }
 
+  /**
+   * `t.me/sendgrams?to=@user|address&amount=…&text=…` or `ton://transfer/<address>?amount=&text=&exp=`
+   */
+  export interface InternalLinkWalletSend {
+    _: INTERNAL_LINK_TYPE.WALLET_SEND,
+    to?: string,
+    /** Grams as a decimal */
+    amount?: string,
+    text?: string,
+    /** the comment goes encrypted: `1` / `true` */
+    encrypted?: string,
+    /** the whole `ton://transfer` link, parsed by the wallet engine */
+    tonLink?: string
+  }
+
+  /**
+   * A TON Connect link (`tc://`, `tg://ton-connect`, `t.me/sendgrams?startapp=tonconnect-…`): a dApp connecting to the
+   * wallet, or waking it up for a request it sent
+   */
+  export interface InternalLinkTonConnect {
+    _: INTERNAL_LINK_TYPE.TON_CONNECT,
+    url: string
+  }
+
   export interface InternalLinkStarsTopup {
     _: INTERNAL_LINK_TYPE.STARS_TOPUP,
     balance: string,
@@ -227,6 +261,11 @@ export namespace InternalLink {
     type?: 'search' | 'sort' | 'new' | 'invite' | 'manage'
   }
 
+  export interface InternalLinkChats {
+    _: INTERNAL_LINK_TYPE.CHATS,
+    type?: 'search' | 'emoji-status'
+  }
+
   // t.me/call/<slug> and tg://call?slug=<slug> — invite link for a
   // TdE2E-encrypted conference call. The slug resolves to an
   // `inputGroupCallSlug` that we feed straight into
@@ -239,6 +278,13 @@ export namespace InternalLink {
   export interface InternalLinkAddAiStyle {
     _: INTERNAL_LINK_TYPE.ADD_AI_STYLE,
     slug: string
+  }
+
+  // t.me/contact/<token> and tg://contact?token=<token> — the one-time link "My QR code" shows
+  // (`contacts.exportContactToken`): whoever opens it gets its owner as a contact
+  export interface InternalLinkContactToken {
+    _: INTERNAL_LINK_TYPE.CONTACT_TOKEN,
+    token: string
   }
 }
 
@@ -268,6 +314,10 @@ export type InternalLinkTypeMap = {
   [INTERNAL_LINK_TYPE.NEW]: InternalLink.InternalLinkNew,
   [INTERNAL_LINK_TYPE.SETTINGS]: InternalLink.InternalLinkSettings,
   [INTERNAL_LINK_TYPE.CONTACTS]: InternalLink.InternalLinkContacts,
+  [INTERNAL_LINK_TYPE.CHATS]: InternalLink.InternalLinkChats,
   [INTERNAL_LINK_TYPE.CONFERENCE_CALL]: InternalLink.InternalLinkConferenceCall,
   [INTERNAL_LINK_TYPE.ADD_AI_STYLE]: InternalLink.InternalLinkAddAiStyle,
+  [INTERNAL_LINK_TYPE.CONTACT_TOKEN]: InternalLink.InternalLinkContactToken,
+  [INTERNAL_LINK_TYPE.WALLET_SEND]: InternalLink.InternalLinkWalletSend,
+  [INTERNAL_LINK_TYPE.TON_CONNECT]: InternalLink.InternalLinkTonConnect,
 };

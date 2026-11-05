@@ -1,12 +1,17 @@
 import bigInt from 'big-integer';
-import {InputSavedStarGift, Message, MessageAction, PremiumGiftCodeOption, SavedStarGift, StarGift, StarGiftAttribute, StarGiftAttributeId, StarGiftCollection, StarGiftUpgradePrice, StarsAmount, WebPageAttribute} from '@layer';
+import {InputCheckPasswordSRP, InputSavedStarGift, Message, MessageAction, PaymentsGetSavedStarGifts, PremiumGiftCodeOption, SavedStarGift, StarGift, StarGiftAttribute, StarGiftAttributeId, StarGiftUpgradePrice, StarsAmount, WebPageAttribute} from '@layer';
 import {STARS_CURRENCY} from '@appManagers/constants';
 import {MyDocument} from '@appManagers/appDocsManager';
 import {AppManager} from '@appManagers/manager';
 import getPeerId from '@appManagers/utils/peers/getPeerId';
-import {nanotonToJsNumber} from '@helpers/paymentsWrapCurrencyAmount';
+import {nanotonToJsNumber} from '@helpers/nanoton';
 import {inputStarGiftEquals} from '@appManagers/utils/gifts/inputStarGiftEquals';
 import {randomLong} from '@helpers/random';
+import createSerializedQueue, {SerializedQueue} from '@helpers/createSerializedQueue';
+import noop from '@helpers/noop';
+
+/** A peer's settings of its gifts that a screen shows before the server takes them (`write`) */
+type GiftsSetting = 'notifications' | 'collectionsOrder';
 
 export interface MyStarGift {
   type: 'stargift',
@@ -102,6 +107,10 @@ export default class AppGiftsManager extends AppManager {
   private cachedStarGiftOptions?: MyStarGift[];
   private cachedStarGiftOptionsHash = 0;
   private wearingGiftSlug?: string | null;
+  /** a peer's settings of its gifts the screens show before the server takes them, by `${setting}_${peerId}` (`write`) */
+  private writeQueues = new Map<string, SerializedQueue>();
+  /** how many of those writes have been answered, by the same key (`getReadKey`) */
+  private writeRevisions = new Map<string, number>();
 
   protected after() {
     this.apiUpdatesManager.addMultipleEventsListeners({
@@ -239,12 +248,17 @@ export default class AppGiftsManager extends AppManager {
       pFlags: {
         unsaved: action.pFlags.saved ? undefined : true,
         can_upgrade: action._ === 'messageActionStarGift' ? action.pFlags.can_upgrade : undefined,
-        refunded: action.pFlags.refunded
+        refunded: action.pFlags.refunded,
+        // layer 229: the buyer of a resold gift chose not to show their name
+        name_hidden: action._ === 'messageActionStarGiftUnique' && action.pFlags.name_hidden ? true : undefined
       },
       from_id: isIncomingGift ? message.peer_id : {_: 'peerUser', user_id: this.rootScope.myId},
       date: message.date,
       gift,
-      message: action._ === 'messageActionStarGift' ? action.message : baseWrap.collectibleAttributes?.original?.message,
+      // layer 229 lets a resale carry its own message; otherwise the gift's original one stands
+      message: action._ === 'messageActionStarGift' ?
+        action.message :
+        (action.message || baseWrap.collectibleAttributes?.original?.message),
       msg_id: action._ === 'messageActionStarGift' && action.pFlags.prepaid_upgrade ? action.gift_msg_id : message.id,
       convert_stars: gift._ === 'starGift' ? gift.convert_stars : undefined,
       upgrade_stars: gift._ === 'starGift' ? gift.upgrade_stars : undefined,
@@ -302,38 +316,33 @@ export default class AppGiftsManager extends AppManager {
     withCollections?: boolean
     collectionId?: number
   }) {
+    // * the settings a page carries as the server has them once their writes on the way are answered
+    await this.afterWrites(params.peerId, params.withCollections ? ['notifications', 'collectionsOrder'] : ['notifications']);
     if(params.peerId === this.rootScope.myId) {
       await this.ensureHaveWearingGiftSlug();
     }
 
     const isUser = params.peerId.isUser();
     const inputPeer = this.appPeersManager.getInputPeerById(params.peerId)
-    const collectionsPromise = params.withCollections ?
-      this.apiManager.invokeApiSingle('payments.getStarGiftCollections', {
-        peer: inputPeer,
-        hash: 0
-      }).catch((err: any): any => {
-        console.warn('Failed to fetch collections', err);
-        return null;
-      }) : null;
-
+    const collectionsPromise = params.withCollections ? this.requestCollections(params.peerId) : null;
     const optionsPromise = this.getStarGiftOptions().catch((): null => null);
-
+    const apiParams: PaymentsGetSavedStarGifts = {
+      peer: inputPeer,
+      offset: params.offset ?? '',
+      limit: params.limit ?? 50,
+      sort_by_value: params.sort === 'value',
+      exclude_unlimited: params.unlimited === false,
+      exclude_unupgradable: params.limited === false,
+      exclude_upgradable: params.upgradable === false,
+      exclude_unique: params.unique === false,
+      exclude_saved: params.displayed === false,
+      exclude_unsaved: params.hidden === false,
+      collection_id: params.collectionId
+    };
     const res = await this.apiManager.invokeApiSingleProcess({
       method: 'payments.getSavedStarGifts',
-      params: {
-        peer: inputPeer,
-        offset: params.offset ?? '',
-        limit: params.limit ?? 50,
-        sort_by_value: params.sort === 'value',
-        exclude_unlimited: params.unlimited === false,
-        exclude_unupgradable: params.limited === false,
-        exclude_upgradable: params.upgradable === false,
-        exclude_unique: params.unique === false,
-        exclude_saved: params.displayed === false,
-        exclude_unsaved: params.hidden === false,
-        collection_id: params.collectionId
-      }
+      params: apiParams,
+      options: {cacheKey: this.getReadKey(params.peerId, 'notifications', JSON.stringify(apiParams))}
     });
 
     this.appPeersManager.saveApiPeers(res);
@@ -358,16 +367,7 @@ export default class AppGiftsManager extends AppManager {
       });
     }
 
-    let collections: StarGiftCollection[] | undefined;
-    if(collectionsPromise) {
-      const res = await collectionsPromise;
-      if(res._ === 'payments.starGiftCollections') {
-        collections = res.collections;
-        for(const it of collections) {
-          if(it.icon) this.appDocsManager.saveDoc(it.icon);
-        }
-      }
-    }
+    const collections = collectionsPromise ? await collectionsPromise : undefined;
 
     if(!params.offset) {
       this.pinnedGiftsByPeer.set(params.peerId, wrapped.filter((it) => it.saved?.pFlags.pinned_to_top).map((it) => it.input));
@@ -377,8 +377,99 @@ export default class AppGiftsManager extends AppManager {
       next: res.next_offset,
       gifts: wrapped,
       count: res.count,
-      collections
+      collections,
+      // * only for a channel whose gifts the user can manage: whether a message comes for each new one
+      chatNotificationsEnabled: res.chat_notifications_enabled
     };
+  }
+
+  private requestCollections(peerId: PeerId) {
+    return this.apiManager.invokeApiSingleProcess({
+      method: 'payments.getStarGiftCollections',
+      params: {
+        peer: this.appPeersManager.getInputPeerById(peerId),
+        hash: 0
+      },
+      options: {cacheKey: this.getReadKey(peerId, 'collectionsOrder', `${peerId}`)},
+      processResult: (res) => {
+        if(res._ !== 'payments.starGiftCollections') {
+          return;
+        }
+
+        for(const it of res.collections) {
+          if(it.icon) this.appDocsManager.saveDoc(it.icon);
+        }
+
+        return res.collections;
+      }
+    });
+  }
+
+  /**
+   * The writes of one of a peer's settings reach the server one after another, whichever screen made them (a
+   * profile closed and opened again makes another): a retried older one cannot land after a newer one
+   */
+  private write<T>(peerId: PeerId, setting: GiftsSetting, send: () => Promise<T>) {
+    const key = `${setting}_${peerId}`;
+    let queue = this.writeQueues.get(key);
+    if(!queue) {
+      this.writeQueues.set(key, queue = createSerializedQueue());
+    }
+
+    return queue.enqueue(() => send().finally(() => {
+      this.writeRevisions.set(key, (this.writeRevisions.get(key) ?? 0) + 1);
+    }));
+  }
+
+  /**
+   * The `cacheKey` of a read that carries the setting: asked after one of its writes has been answered, the read
+   * never joins one asked before - whose answer may be from before the write
+   */
+  private getReadKey(peerId: PeerId, setting: GiftsSetting, key: string) {
+    return `${key}_${this.writeRevisions.get(`${setting}_${peerId}`) ?? 0}`;
+  }
+
+  /** Waits for the writes of these settings already on their way: a read after it has them as the server does */
+  private afterWrites(peerId: PeerId, settings: GiftsSetting[]) {
+    return Promise.all(settings.map((setting) => this.writeQueues.get(`${setting}_${peerId}`)?.enqueue(noop)));
+  }
+
+  public toggleChatGiftNotifications(peerId: PeerId, enabled: boolean) {
+    return this.write(peerId, 'notifications', () => this.apiManager.invokeApi('payments.toggleChatStarGiftNotifications', {
+      peer: this.appPeersManager.getInputPeerById(peerId),
+      enabled
+    }));
+  }
+
+  /** Whether a message comes for each new gift of a channel, as `getProfileGifts` says it, read alone */
+  public async getChatGiftNotifications(peerId: PeerId) {
+    await this.afterWrites(peerId, ['notifications']);
+    return this.apiManager.invokeApiSingleProcess({
+      method: 'payments.getSavedStarGifts',
+      params: {
+        peer: this.appPeersManager.getInputPeerById(peerId),
+        offset: '',
+        limit: 1
+      },
+      // * of its own: a page's answer is not this one's
+      options: {cacheKey: this.getReadKey(peerId, 'notifications', `notifications_${peerId}`)},
+      processResult: (res) => {
+        this.appPeersManager.saveApiPeers(res);
+        return res.chat_notifications_enabled;
+      }
+    });
+  }
+
+  public checkCanSendGift(giftId: Long) {
+    return this.apiManager.invokeApi('payments.checkCanSendGift', {
+      gift_id: giftId
+    });
+  }
+
+  // * layer 232 takes a temporary password made of the 2FA one
+  public async getGiftWithdrawalUrl(stargift: InputSavedStarGift, password: InputCheckPasswordSRP) {
+    const {tmp_password} = await this.passwordManager.getTmpPassword(password, 60);
+    return this.apiManager.invokeApi('payments.getStarGiftWithdrawalUrl', {stargift, tmp_password});
   }
 
   public async getStarGiftOptions(): Promise<MyStarGift[]> {
@@ -413,18 +504,39 @@ export default class AppGiftsManager extends AppManager {
     return this.cachedStarGiftOptions = options;
   }
 
+  // * The two below are shown once the server has taken them, as tdesktop shows them (ToggleStarGiftSaved,
+  // * ConvertStarGift): shown before and refused, the gift stayed as it was shown, not as it is - and taking it back
+  // * would have to guess what it is (another screen or tab may have changed it meanwhile)
   public async toggleGiftHidden(gift: InputSavedStarGift, hidden: boolean) {
-    this.rootScope.dispatchEvent('star_gift_update', {input: gift, unsaved: hidden});
     await this.apiManager.invokeApiSingle('payments.saveStarGift', {
       stargift: gift,
       unsave: hidden
     });
+    this.rootScope.dispatchEvent('star_gift_update', {input: gift, unsaved: hidden});
   }
 
   public async convertGift(gift: InputSavedStarGift) {
-    this.rootScope.dispatchEvent('star_gift_update', {input: gift, converted: true});
     await this.apiManager.invokeApiSingle('payments.convertStarGift', {
       stargift: gift
+    });
+    this.rootScope.dispatchEvent('star_gift_update', {input: gift, converted: true});
+
+    // * the server does not edit the gift's message, so it is marked here for its bubble to say so
+    if(gift._ !== 'inputSavedStarGiftUser') return;
+    const mid = this.appMessagesIdsManager.generateMessageId(gift.msg_id);
+    const message = this.appMessagesManager.getMessageById(mid) as Message.messageService;
+    if(message?._ !== 'messageService' || message.action._ !== 'messageActionStarGift') return;
+
+    const storage = this.appMessagesManager.getHistoryMessagesStorage(message.peerId);
+    this.appMessagesManager.modifyMessage(message, (message) => {
+      (message.action as MessageAction.messageActionStarGift).pFlags.converted = true;
+    }, storage);
+
+    this.rootScope.dispatchEvent('message_edit', {
+      storageKey: storage.key,
+      peerId: message.peerId,
+      mid: message.mid,
+      message
     });
   }
 
@@ -486,7 +598,8 @@ export default class AppGiftsManager extends AppManager {
       }).catch((): null => null)
     ]);
 
-    this.appUsersManager.saveApiUsers(result.users);
+    // * the owner (or host) can be a channel, so the chats matter as much as the users
+    this.appPeersManager.saveApiPeers(result);
 
     const ret = this.wrapGift(result.gift);
     if(savedResult) {
@@ -678,6 +791,35 @@ export default class AppGiftsManager extends AppManager {
       }
       throw err;
     }
+  }
+
+  public createCollection(peerId: PeerId, title: string) {
+    return this.apiManager.invokeApi('payments.createStarGiftCollection', {
+      title,
+      peer: this.appPeersManager.getInputPeerById(peerId),
+      stargift: []
+    });
+  }
+
+  public deleteCollection(peerId: PeerId, collectionId: number) {
+    return this.apiManager.invokeApi('payments.deleteStarGiftCollection', {
+      collection_id: collectionId,
+      peer: this.appPeersManager.getInputPeerById(peerId)
+    });
+  }
+
+  /** `order` is every collection's id, in the order they are to be shown */
+  public reorderCollections(peerId: PeerId, order: number[]) {
+    return this.write(peerId, 'collectionsOrder', () => this.apiManager.invokeApi('payments.reorderStarGiftCollections', {
+      peer: this.appPeersManager.getInputPeerById(peerId),
+      order
+    }));
+  }
+
+  /** A peer's collections in the order the server keeps, once the writes of that order on their way are answered */
+  public async getCollections(peerId: PeerId) {
+    await this.afterWrites(peerId, ['collectionsOrder']);
+    return this.requestCollections(peerId);
   }
 
   public async resolveGiftOffer(msgId: number, action: 'accept' | 'reject') {

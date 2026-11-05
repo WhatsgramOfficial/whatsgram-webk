@@ -30,7 +30,7 @@ import windowSize from '@helpers/windowSize';
 import {logger, LogTypes} from '@lib/logger';
 import {MOUNT_CLASS_TO} from '@config/debug';
 import {DEFAULT_BACKGROUND_SLUG} from '@config/app';
-import {AppManagers} from '@lib/managers';
+import {ReadingManagers} from '@lib/managers';
 import {AppTheme} from '@config/state';
 import {appState} from '@stores/appState';
 import classNames from '@helpers/string/classNames';
@@ -70,7 +70,7 @@ export type ChatBackgroundProps = {
   /** Override the global theme controller — used by the passcode lock screen for HMR safety. */
   themeController?: ThemeController;
   /** Override the global managers — same reason as `themeController`. */
-  managers?: AppManagers;
+  managers?: ReadingManagers;
   /**
    * Pattern-canvas size (CSS pixels). Defaults to the window size — correct for full-screen chat
    * backgrounds, but wasteful for thumbnails. Picker / theme-tile previews should pass the actual
@@ -83,6 +83,11 @@ export type ChatBackgroundProps = {
   onHighlightColor?: (hsla: string) => void;
   onCachedStatus?: (cached: boolean) => void;
   onReady?: () => void;
+  /**
+   * A pattern that has to be downloaded shows its colours meanwhile, and fades in over them once it is drawn (a tile
+   * of a list, which is not held back by its pattern). `onReady` still waits for the pattern
+   */
+  colorsFirst?: boolean;
   /**
    * Hand off the staging-slot reveal to the caller. When set, the effect builds and stages the
    * new bg offstage as usual, then calls `deferReveal(reveal)` — the caller is responsible for
@@ -111,6 +116,8 @@ type Slot = {
   gradientCanvas?: HTMLCanvasElement;
   patternCanvas?: HTMLCanvasElement;
   image?: HTMLImageElement;
+  /** a pattern's colours alone, which its pattern is still to come over (`colorsFirst`) */
+  colorsOnly?: boolean;
 };
 
 /**
@@ -140,7 +147,7 @@ const log = logger('CHAT-BG', LogTypes.Log | LogTypes.Warn | LogTypes.Error);
 
 async function resolveFromPeer(
   peerId: PeerId,
-  managers: AppManagers
+  managers: ReadingManagers
 ): Promise<{theme?: ChatBackgroundTheme, wallPaper?: WallPaper}> {
   if(!peerId.isUser()) return {};
   const full = await managers.appProfileManager.getCachedFullUser(peerId.toUserId());
@@ -170,14 +177,14 @@ function resolveBackgroundSync(
   return untrack(() => {
     const globalTheme = themeController.getTheme();
     const theme = options.theme ?? globalTheme;
-    const wallPaper = options.wallPaper ?? themeController.getThemeSettings(theme).wallpaper;
+    const wallPaper = options.wallPaper ?? themeController.getThemeWallpaper(theme);
     return {theme, wallPaper};
   });
 }
 
 function getWallPaperUrl(
   wallPaper: WallPaper,
-  managers: AppManagers | undefined
+  managers: ReadingManagers | undefined
 ): {urlOrPromise: string | Promise<string> | undefined, isColorOnly: boolean} {
   const colors = getColorsFromWallPaper(wallPaper);
   const slug = (wallPaper as WallPaper.wallPaper)?.slug;
@@ -252,6 +259,7 @@ function buildContent(
     if(useOverlayRender) patternCanvas.classList.add(styles.DarkPatternInvert);
   } else if(url) {
     image = document.createElement('img');
+    image.alt = '';
     image.classList.add(styles.CanvasCommon);
   }
 
@@ -336,6 +344,7 @@ function clearSlot(slot: Slot) {
   slot.gradientCanvas = undefined;
   slot.patternCanvas = undefined;
   slot.image = undefined;
+  slot.colorsOnly = undefined;
 }
 
 function transitionClassFor(transition: ChatBackgroundTransition): string | undefined {
@@ -384,7 +393,7 @@ export const ChatBackground: Component<ChatBackgroundProps> = (props) => {
   let tempId = 0;
 
   const themeController = (): ThemeController => props.themeController ?? themeControllerSingleton;
-  const managers = (): AppManagers | undefined => props.managers ?? rootScope.managers;
+  const managers = (): ReadingManagers | undefined => props.managers ?? rootScope.managers;
 
   /** Promotes `stagingSlot` to visible and demotes `visibleSlot`, then swaps the references. */
   const presentStagingSlot = (transition: ChatBackgroundTransition) => {
@@ -462,7 +471,7 @@ export const ChatBackground: Component<ChatBackgroundProps> = (props) => {
 
       const resolved = resolveBackgroundSync({theme, wallPaper}, ctl);
 
-      if(visibleSlot.appliedTheme === resolved.theme && visibleSlot.appliedWallPaper === resolved.wallPaper) {
+      if(visibleSlot.appliedTheme === resolved.theme && visibleSlot.appliedWallPaper === resolved.wallPaper && !visibleSlot.colorsOnly) {
         log('same background, skipping');
         props.onCachedStatus?.(true);
         // No DOM change to reveal — the caller will still try to invoke reveal in sync with
@@ -479,6 +488,19 @@ export const ChatBackground: Component<ChatBackgroundProps> = (props) => {
       if(urlOrPromise !== undefined) {
         cached = !(urlOrPromise instanceof Promise);
         props.onCachedStatus?.(cached);
+        if(
+          !cached &&
+          props.colorsFirst &&
+          (resolved.wallPaper as WallPaper.wallPaper)?.pFlags?.pattern &&
+          getColorsFromWallPaper(resolved.wallPaper)
+        ) {
+          // its colours alone (a pattern built with no picture of it), till the pattern comes over them
+          clearSlot(stagingSlot);
+          attachBuiltToSlot(stagingSlot, buildContent(layer, resolved, undefined, 0, 0));
+          stagingSlot.colorsOnly = true;
+          presentStagingSlot('instant');
+        }
+
         try {
           url = await urlOrPromise;
         } catch(err) {
@@ -506,7 +528,7 @@ export const ChatBackground: Component<ChatBackgroundProps> = (props) => {
       }
 
       const hadPrevious = !!visibleSlot.appliedWallPaper;
-      const transition = resolveTransition(props.transition, cached, hadPrevious);
+      const transition = visibleSlot.colorsOnly ? 'fade' : resolveTransition(props.transition, cached, hadPrevious);
 
       clearSlot(stagingSlot);
       attachBuiltToSlot(stagingSlot, built);
@@ -558,6 +580,7 @@ export const ChatBackground: Component<ChatBackgroundProps> = (props) => {
  */
 const appChatBackground = (() => {
   const element = document.createElement('div');
+  element.setAttribute('aria-hidden', 'true');
 
   // Solid signal driving the embedded `<ChatBackground>` props.
   const [props, setProps] = createSignal<ChatBackgroundProps>({});

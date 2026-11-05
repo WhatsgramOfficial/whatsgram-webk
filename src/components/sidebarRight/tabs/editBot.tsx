@@ -16,13 +16,14 @@ import EditBotCommunitySection
 from '@components/communities/editBotCommunitySection';
 import {InputFieldTsx} from '@components/inputFieldTsx';
 import Section from '@components/section';
+import TransactionHistorySection from '@components/stars/transactionHistory';
 import {usePromiseCollector} from '@components/solidJsTabs/promiseCollector';
 import {useSuperTab} from '@components/solidJsTabs/superTabProvider';
 import type {AppEditBotTab} from '@components/solidJsTabs/tabs';
 import {toastNew} from '@components/toast';
 import UsernameInputFieldTsx from '@components/usernameInputFieldTsx';
 import type {UsernameInputField} from '@components/usernameInputField';
-import UsernamesSectionTsx from '@components/usernamesSectionTsx';
+import UsernamesSection from '@components/usernamesSection';
 import {purchaseUsernameCaption}
 from '@components/sidebarLeft/tabs/purchaseUsernameCaption';
 import type {User} from '@layer';
@@ -220,6 +221,7 @@ function EditBotForm(props: {data: EditBotData}) {
         props.data.user.pFlags.bot &&
         props.data.user.pFlags.bot_can_edit
       }>
+        <TransactionHistorySection peerId={props.data.peerId} stars ton />
         <EditBotCommunitySection
           tab={tab}
           peerId={props.data.peerId}
@@ -242,6 +244,7 @@ function EditBotForm(props: {data: EditBotData}) {
             managers={tab.managers}
             instanceRef={setUsernameField}
             originalValue={initialUsername}
+            containerClass="disable-hover"
             label="Username"
             name="username"
             plainText
@@ -267,12 +270,10 @@ function EditBotForm(props: {data: EditBotData}) {
 
       <Show when={usernameField()}>
         {(field) => (
-          <UsernamesSectionTsx
+          <UsernamesSection
             peerId={props.data.peerId}
             peer={props.data.user}
-            listenerSetter={tab.listenerSetter}
             usernameInputField={field()}
-            middleware={tab.middlewareHelper.get()}
           />
         )}
       </Show>

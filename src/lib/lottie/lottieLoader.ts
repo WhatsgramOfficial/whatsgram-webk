@@ -8,16 +8,27 @@ import LottiePlayer, {LottieOptions} from '@lib/lottie/lottiePlayer';
 import blobConstruct from '@helpers/blob/blobConstruct';
 import apiManagerProxy from '@lib/apiManagerProxy';
 import IS_WEB_ASSEMBLY_SIMD_SUPPORTED from '@environment/webAssemblySimdSupport';
+import IS_WEB_ASSEMBLY_BASELINE_SUPPORTED from '@environment/webAssemblyBaselineSupport';
 import makeError from '@helpers/makeError';
 import rootScope from '@lib/rootScope';
 import toArray from '@helpers/array/toArray';
 import lottieMessagePort from '@lib/lottie/lottieMessagePort';
 import SHOULD_RENDER_OFFSCREEN from '@lib/lottie/shouldRenderOffscreen';
 import tlottieWasmAssetUrl from '@vendor/tlottie/tlottie.wasm?url';
+import tlottieNoSimdWasmAssetUrl from '@vendor/tlottie/tlottie.nosimd.wasm?url';
 
-const TLOTTIE_WASM_URL = new URL(tlottieWasmAssetUrl, location.href).href;
+// tlottie builds the same renderer twice - the SIMD build is the fast path, the scalar
+// one keeps stickers animated on browsers without WebAssembly SIMD (Chrome 75-90,
+// Firefox 79-88, Safari 15-16.3). Both render frame-identical output.
+const TLOTTIE_WASM_URL = new URL(
+  IS_WEB_ASSEMBLY_SIMD_SUPPORTED ? tlottieWasmAssetUrl : tlottieNoSimdWasmAssetUrl,
+  location.href
+).href;
 
 export type LottieAssetName =
+  | 'BusinessHours'
+  | 'BusinessLocation'
+  | 'BusinessLinks'
   | 'EmptyFolder'
   | 'Folders_1'
   | 'Folders_2'
@@ -61,7 +72,20 @@ export type LottieAssetName =
   | 'key'
   | 'UtyanDisappear'
   | 'hand_stop'
+  | 'collectible_username'
+  | 'collectible_phone'
+  | 'Experimental'
+  | 'Gram'
+  | 'WalletWordList'
+  | 'WalletWordCheck'
 ;
+
+/**
+ * An asset whose data is already being fetched — what a tab's `getInitArgs` starts
+ * with {@link LottieLoader.loadAnimationFromURLManually}, so the sticker is there by
+ * the time the tab's component renders.
+ */
+export type PreloadedLottieAsset = ReturnType<LottieLoader['loadAnimationFromURLManually']>;
 
 export class LottieLoader {
   private loadPromise: Promise<void>;
@@ -69,6 +93,7 @@ export class LottieLoader {
 
   private players: {[reqId: number]: LottiePlayer} = {};
   private playersByCacheName: {[cacheName: string]: Set<LottiePlayer>} = {};
+  private assetData = new Map<string, Promise<Blob>>();
 
   private log = logger('LOTTIE', LogTypes.Error);
 
@@ -116,7 +141,7 @@ export class LottieLoader {
   }
 
   public loadLottieWorkers() {
-    if(!IS_WEB_ASSEMBLY_SIMD_SUPPORTED) {
+    if(!IS_WEB_ASSEMBLY_BASELINE_SUPPORTED) {
       // This method is also used as a fire-and-forget preload. Unsupported
       // browsers should stay on their static fallback without an unhandled
       // rejection; actual animation loads still reject with NO_WASM below.
@@ -158,13 +183,31 @@ export class LottieLoader {
 
   public loadAnimationAsAsset(params: Omit<LottieOptions, 'animationData' | 'name'>, name: LottieAssetName) {
     // (params as LottieOptions).name = name;
-    return this.loadAnimationFromURL(params, this.makeAssetUrl(name));
+    const url = this.makeAssetUrl(name);
+    return this.loadAssetData(url).then((blob) => {
+      return this.loadAnimationFromURLNext(blob, params, url);
+    });
+  }
+
+  /**
+   * An app asset is fetched once. A list of the same animated icon — a video chat's microphones —
+   * used to send a request per icon, which the browser's per-host connection limit served in
+   * waves: on a slow link the icons appeared one batch after another.
+   */
+  private loadAssetData(url: string) {
+    let promise = this.assetData.get(url);
+    if(!promise) {
+      this.assetData.set(url, promise = this.loadAnimationDataFromURL(url));
+      promise.catch(() => this.assetData.delete(url));
+    }
+
+    return promise;
   }
 
   public loadAnimationDataFromURL(url: string, method: 'json'): Promise<any>;
   public loadAnimationDataFromURL(url: string, method?: 'blob'): Promise<Blob>;
   public loadAnimationDataFromURL(url: string, method: 'json' | 'blob' = 'blob'): Promise<Blob | any> {
-    if(!IS_WEB_ASSEMBLY_SIMD_SUPPORTED) {
+    if(!IS_WEB_ASSEMBLY_BASELINE_SUPPORTED) {
       return Promise.reject(makeError('NO_WASM'));
     }
 
@@ -187,7 +230,7 @@ export class LottieLoader {
 
   public loadAnimationFromURLManually(name: LottieAssetName) {
     const url = this.makeAssetUrl(name);
-    return this.loadAnimationDataFromURL(url).then((blob) => {
+    return this.loadAssetData(url).then((blob) => {
       return (params: Omit<LottieOptions, 'animationData'>) => this.loadAnimationFromURLNext(blob, params, url);
     });
   }
@@ -223,7 +266,7 @@ export class LottieLoader {
   }
 
   public async loadAnimationWorker(params: LottieOptions): Promise<LottiePlayer> {
-    if(!IS_WEB_ASSEMBLY_SIMD_SUPPORTED) {
+    if(!IS_WEB_ASSEMBLY_BASELINE_SUPPORTED) {
       throw makeError('NO_WASM');
     }
 
@@ -309,7 +352,7 @@ export class LottieLoader {
   }
 
   public destroyWorkers() {
-    if(!IS_WEB_ASSEMBLY_SIMD_SUPPORTED) {
+    if(!IS_WEB_ASSEMBLY_BASELINE_SUPPORTED) {
       return;
     }
 
@@ -364,6 +407,9 @@ export class LottieLoader {
   }
 }
 
+// made once: a hot update keeps it and moves it onto the edited class (see @helpers/hotRegistry)
 const lottieLoader = new LottieLoader();
 MOUNT_CLASS_TO.lottieLoader = lottieLoader;
 export default lottieLoader;
+
+if(import.meta.hot) import.meta.hot.accept();

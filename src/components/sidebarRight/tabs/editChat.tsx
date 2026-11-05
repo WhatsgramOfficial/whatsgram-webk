@@ -18,27 +18,17 @@ import AvatarEdit, {AvatarEditPayload} from '@components/avatarEdit';
 import Button from '@components/buttonTsx';
 import CheckboxFieldTsx from '@components/checkboxFieldTsx';
 import {InputFieldTsx} from '@components/inputFieldTsx';
+import Badge from '@components/badge';
+import {IconTsx} from '@components/iconTsx';
+import openBoosts from '@components/openBoosts';
 import {handleChannelsTooMuch} from '@components/popups/channelsTooMuch';
 import Row from '@components/rowTsx';
 import Section from '@components/section';
-import {AppDirectMessagesTab} from '@components/solidJsTabs';
+import TransactionHistorySection from '@components/stars/transactionHistory';
 import {usePromiseCollector} from '@components/solidJsTabs/promiseCollector';
 import {useSuperTab} from '@components/solidJsTabs/superTabProvider';
-import {
-  AppAddGroupToCommunityTab,
-  AppAdminRecentActionsTab,
-  AppChatAdministratorsTab,
-  AppChatDiscussionTab,
-  AppChatInviteLinksTab,
-  AppChatMembersTab,
-  AppChatReactionsTab,
-  AppChatRequestsTab,
-  AppChatTypeTab,
-  AppEditChatTab,
-  AppGroupPermissionsTab,
-  AppRemovedUsersTab
-} from '@components/solidJsTabs/tabs';
 import cancelEvent from '@helpers/dom/cancelEvent';
+import wrapMessageForReply from '@components/wrappers/messageForReply';
 import anchorCallback from '@helpers/dom/anchorCallback';
 import numberThousandSplitter, {
   numberThousandSplitterForStars
@@ -49,6 +39,8 @@ import type {LangPackKey} from '@lib/langPack';
 import rootScope from '@lib/rootScope';
 import {useHotReloadGuard} from '@lib/solidjs/hotReloadGuard';
 import {appSettings} from '@stores/appSettings';
+import type {AppEditChatTab} from '@components/solidJsTabs/tabs';
+import {hotReloadGuard} from '@lib/solidjs/hotReloadGuardProvider';
 
 const PERMISSION_FLAGS = [
   'send_stickers',
@@ -137,7 +129,6 @@ function EditChatForm(props: {
     CommunityLinkSection,
     I18n,
     PeerTitleTsx,
-    PopupElement,
     apiManagerProxy,
     appDialogsManager,
     appImManager,
@@ -145,7 +136,8 @@ function EditChatForm(props: {
     hideToast,
     i18n,
     join,
-    toastNew
+    toastNew,
+    wrapEmojiText
   } = useHotReloadGuard();
   const [chat, setChat] = createSignal<EditChat>(props.data.chat);
   const [chatFull, setChatFull] = createSignal<EditChatFull>(props.data.chatFull);
@@ -204,6 +196,22 @@ function EditChatForm(props: {
   });
   const showDiscussion = createMemo(() => {
     return isAdmin() && (isBroadcast() || !!linkedChatId());
+  });
+  const isMegagroup = () => !!channel()?.pFlags.megagroup;
+  // the server decides when a group is big enough to own a sticker set
+  const showGroupStickers = createMemo(() => {
+    return isMegagroup() && !!channelFull()?.pFlags?.can_set_stickers;
+  });
+  const showGroupEmojiPack = createMemo(() => {
+    return isMegagroup() && canChangeInfo() && isAdmin();
+  });
+  // the entry stays visible below the required level, badged and gated on apply
+  const emojiPackRequiredLevel = () => props.data.appConfig.group_emoji_stickers_level_min ?? 0;
+  const emojiPackLevelMissing = createMemo(() => {
+    return (channel()?.level ?? 0) < emojiPackRequiredLevel();
+  });
+  const hasGroupStickersSection = createMemo(() => {
+    return showGroupStickers() || showGroupEmojiPack();
   });
   const hasMainSettings = createMemo(() => {
     return canChangeType() ||
@@ -264,6 +272,10 @@ function EditChatForm(props: {
       i18n('Stars', [numberThousandSplitterForStars(stars)]) :
       i18n('ChannelDirectMessages.Settings.Free');
   });
+  const groupStickerSetSubtitle = (isEmoji: boolean) => {
+    const set = isEmoji ? channelFull()?.emojiset : channelFull()?.stickerset;
+    return set ? wrapEmojiText(set.title) : i18n('Checkbox.Disabled');
+  };
   const permissionsSubtitle = createMemo(() => {
     const permissions = PERMISSION_FLAGS.reduce((count, flag) => {
       return count + +hasRights(chat(), flag, chat().default_banned_rights);
@@ -349,6 +361,36 @@ function EditChatForm(props: {
     }
   });
 
+  // layer 229: the messages each new member is greeted with. A group's, or a channel's one is
+  // in (desktop's condition); the row says what a single one says, how many there are, or that
+  // there are none.
+  const canManageWelcomeMessages = () => hasRights(chat(), 'manage_welcome_messages') &&
+    (!isChannel() || !!channel()?.pFlags.megagroup || (isBroadcast() && !channel()?.pFlags.left));
+  const [welcomePreview, setWelcomePreview] = createSignal<string | DocumentFragment | HTMLElement>();
+  const refreshWelcomePreview = async() => {
+    if(!canManageWelcomeMessages()) return;
+    const peer = peerId();
+    const mids = await tab.managers.appMessagesManager.getWelcomeMessages(peer);
+    let preview: string | DocumentFragment | HTMLElement;
+    if(mids.length > 1) {
+      preview = i18n('messages', [mids.length]);
+    } else if(mids.length) {
+      const message = await tab.managers.appMessagesManager.getWelcomeMessage(peer, mids[0]);
+      preview = message?._ === 'message' ? await wrapMessageForReply({message}) : undefined;
+    }
+    if(alive && peer === peerId()) setWelcomePreview(preview);
+  };
+  void refreshWelcomePreview();
+  subscribeOn(rootScope)('welcome_message_new', (message) => {
+    if(message.peerId === peerId()) void refreshWelcomePreview();
+  });
+  subscribeOn(rootScope)('welcome_messages_delete', ({peerId: updatedPeerId}) => {
+    if(updatedPeerId === peerId()) void refreshWelcomePreview();
+  });
+  subscribeOn(rootScope)('message_edit', ({storageKey}) => {
+    if(storageKey === `${peerId()}_welcome`) void refreshWelcomePreview();
+  });
+
   const save = async() => {
     if(!canSave()) {
       return;
@@ -404,10 +446,17 @@ function EditChatForm(props: {
       langPackKey: 'ChannelAutotranslationLevelMin',
       langPackArguments: [
         props.data.appConfig.channel_autotranslation_level_min,
-        anchorCallback(async() => {
+        anchorCallback(() => {
           hideToast();
-          const {default: PopupBoost} = await import('@components/popups/boost');
-          PopupElement.createPopup(PopupBoost, peerId());
+          openBoosts({
+            peerId: peerId(),
+            slider: tab.slider,
+            reason: {
+              titleLangKey: 'ChannelAutotranslation.BoostTitle',
+              descriptionLangKey: 'ChannelAutotranslation.BoostDescription',
+              descriptionArgs: [props.data.appConfig.channel_autotranslation_level_min]
+            }
+          });
         })
       ]
     });
@@ -511,9 +560,9 @@ function EditChatForm(props: {
 
     setDeleting(true);
     try {
-      const {default: PopupDeleteDialog} = await import('@components/popups/deleteDialog');
+      const {default: showDeleteDialogPopup} = await import('@components/popups/deleteDialog');
       setDeleting(false);
-      PopupElement.createPopup(PopupDeleteDialog, peerId(), undefined, (promise) => {
+      showDeleteDialogPopup(peerId(), undefined, (promise) => {
         setDeleting(true);
         promise.then(() => {
           tab.close();
@@ -603,12 +652,12 @@ function EditChatForm(props: {
         <Section caption={mainCaption()}>
           <Show when={canChangeType()}>
             <Row clickable={() => {
-              tab.slider.createTab(AppChatTypeTab).open({
+              tab.slider.createTab(hotReloadGuard.tabs.AppChatTypeTab).open({
                 chatId: chatId(),
                 chatFull: chatFull()
               });
             }}>
-              <Row.Icon icon="lock" />
+              <Row.Icon icon="lock_filled" />
               <Row.Title>{i18n(isBroadcast() ? 'ChannelType' : 'GroupType')}</Row.Title>
               <Row.Subtitle>{i18n((() => {
                 const isPublic = !!getPeerActiveUsernames(channel())[0];
@@ -623,12 +672,12 @@ function EditChatForm(props: {
 
           <Show when={canManageInviteLinks()}>
             <Row clickable={() => {
-              tab.slider.createTab(AppChatInviteLinksTab).open({
+              tab.slider.createTab(hotReloadGuard.tabs.AppChatInviteLinksTab).open({
                 chatId: chatId(),
-                p: AppChatInviteLinksTab.getInitArgs(chatId())
+                p: hotReloadGuard.tabs.AppChatInviteLinksTab.getInitArgs(chatId())
               });
             }}>
-              <Row.Icon icon="link" />
+              <Row.Icon icon="link_filled" />
               <Row.Title>{i18n('InviteLinks')}</Row.Title>
               <Row.Subtitle>1</Row.Subtitle>
             </Row>
@@ -636,7 +685,7 @@ function EditChatForm(props: {
 
           <Show when={canInviteUsers() && isAdmin() && !!chatFull().requests_pending}>
             <Row clickable={() => {
-              tab.slider.createTab(AppChatRequestsTab).open(chatId());
+              tab.slider.createTab(hotReloadGuard.tabs.AppChatRequestsTab).open(chatId());
             }}>
               <Row.Icon icon="adduser" />
               <Row.Title>{i18n(isBroadcast() ? 'SubscribeRequests' : 'MemberRequests')}</Row.Title>
@@ -646,9 +695,9 @@ function EditChatForm(props: {
 
           <Show when={canChangeInfo() && isAdmin()}>
             <Row clickable={() => {
-              tab.slider.createTab(AppChatReactionsTab).open({chatId: chatId()});
+              tab.slider.createTab(hotReloadGuard.tabs.AppChatReactionsTab).open({chatId: chatId()});
             }}>
-              <Row.Icon icon="reactions" />
+              <Row.Icon icon="reactions_filled" />
               <Row.Title>{i18n('Reactions')}</Row.Title>
               <Row.Subtitle>{reactionsSubtitle()}</Row.Subtitle>
             </Row>
@@ -658,10 +707,10 @@ function EditChatForm(props: {
             <Row clickable={() => {
               const value = channel();
               if(value) {
-                tab.slider.createTab(AppDirectMessagesTab).open({chat: value});
+                tab.slider.createTab(hotReloadGuard.tabs.AppDirectMessagesTab).open({chat: value});
               }
             }}>
-              <Row.Icon icon="messageunread" />
+              <Row.Icon icon="message_filled" />
               <Row.Title>{i18n('ChannelDirectMessages.Settings.Title')}</Row.Title>
               <Row.Subtitle>{directMessagesSubtitle()}</Row.Subtitle>
             </Row>
@@ -669,9 +718,9 @@ function EditChatForm(props: {
 
           <Show when={canChangePermissions() && !isBroadcast() && !isBroadcastGroup()}>
             <Row clickable={() => {
-              tab.slider.createTab(AppGroupPermissionsTab).open({chatId: chatId()});
+              tab.slider.createTab(hotReloadGuard.tabs.AppGroupPermissionsTab).open({chatId: chatId()});
             }}>
-              <Row.Icon icon="permissions" />
+              <Row.Icon icon="key_filled" />
               <Row.Title>{i18n('ChannelPermissions')}</Row.Title>
               <Row.Subtitle>{permissionsSubtitle()}</Row.Subtitle>
             </Row>
@@ -679,12 +728,12 @@ function EditChatForm(props: {
 
           <Show when={showDiscussion()}>
             <Row clickable={() => {
-              tab.slider.createTab(AppChatDiscussionTab).open({
+              tab.slider.createTab(hotReloadGuard.tabs.AppChatDiscussionTab).open({
                 chatId: chatId(),
                 linkedChatId: linkedChatId()
               });
             }}>
-              <Row.Icon icon="comments" />
+              <Row.Icon icon="bubble_filled" />
               <Row.Title>{i18n(isBroadcast() ? 'PeerInfo.Discussion' : 'LinkedChannel')}</Row.Title>
               <Row.Subtitle>
                 <Show when={linkedChatId()} fallback={i18n('PeerInfo.Discussion.Add')}>
@@ -694,10 +743,23 @@ function EditChatForm(props: {
             </Row>
           </Show>
 
+          <Show when={canManageWelcomeMessages()}>
+            <Row clickable={() => {
+              appImManager.setInnerPeer({
+                peerId: peerId(),
+                type: ChatType.Welcome
+              });
+            }}>
+              <Row.Icon icon="message_filled" />
+              <Row.Title>{i18n('WelcomeMessages.Title')}</Row.Title>
+              <Row.Subtitle class="text-overflow">{welcomePreview() || i18n('Off')}</Row.Subtitle>
+            </Row>
+          </Show>
+
           <Show when={isAdmin() && isChannel()}>
             <Row clickable={() => {
               if(appSettings.logsDiffView) {
-                tab.slider.createTab(AppAdminRecentActionsTab).open({
+                tab.slider.createTab(hotReloadGuard.tabs.AppAdminRecentActionsTab).open({
                   channelId: chatId(),
                   isBroadcast: isBroadcast()
                 });
@@ -708,18 +770,16 @@ function EditChatForm(props: {
                 });
               }
             }}>
-              <Row.Icon icon="clipboard" />
+              <Row.Icon icon="recent_actions_filled" />
               <Row.Title>{i18n('RecentActions')}</Row.Title>
             </Row>
           </Show>
 
           <Show when={showTopics()}>
-            <Row clickable={(event) => {
-              if(linkedChatId()) {
-                toastNew({langPackKey: 'ChannelTopicsDiscussionForbidden'});
-                cancelEvent(event);
-              }
-            }}>
+            <Row clickable={linkedChatId() ? (event) => {
+              toastNew({langPackKey: 'ChannelTopicsDiscussionForbidden'});
+              cancelEvent(event);
+            } : undefined}>
               <Row.CheckboxFieldToggle>
                 <CheckboxFieldTsx
                   toggle
@@ -728,8 +788,45 @@ function EditChatForm(props: {
                   onChange={(value) => void toggleTopics(value)}
                 />
               </Row.CheckboxFieldToggle>
-              <Row.Icon icon="topics" />
+              <Row.Icon icon="topics_filled" />
               <Row.Title>{i18n('Topics')}</Row.Title>
+            </Row>
+          </Show>
+        </Section>
+      </Show>
+
+      <TransactionHistorySection
+        peerId={peerId()}
+        stars={channelFull()?.pFlags.can_view_stars_revenue}
+        ton={channelFull()?.pFlags.can_view_revenue}
+      />
+
+      <Show when={hasGroupStickersSection()}>
+        <Section name="GroupStickers" caption="GroupStickers.SectionInfo">
+          <Show when={showGroupStickers()}>
+            <Row clickable={() => {
+              tab.slider.createTab(hotReloadGuard.tabs.AppGroupStickersTab).open({chatId: chatId()});
+            }}>
+              <Row.Icon icon="sticker_filled" />
+              <Row.Title>{i18n('GroupStickers')}</Row.Title>
+              <Row.Subtitle>{groupStickerSetSubtitle(false)}</Row.Subtitle>
+            </Row>
+          </Show>
+
+          <Show when={showGroupEmojiPack()}>
+            <Row clickable={() => {
+              tab.slider.createTab(hotReloadGuard.tabs.AppGroupStickersTab).open({chatId: chatId(), isEmoji: true});
+            }}>
+              <Row.Icon icon="emoji_filled" />
+              <Row.Title titleRight={emojiPackLevelMissing() ? (
+                <Badge tag="span" rectangle class="badge-rectangle-with-icon">
+                  <IconTsx icon="premium_lock" />
+                  {i18n('BoostsLevel', [emojiPackRequiredLevel()])}
+                </Badge>
+              ) : undefined}>
+                {i18n('GroupEmojiPack')}
+              </Row.Title>
+              <Row.Subtitle>{groupStickerSetSubtitle(true)}</Row.Subtitle>
             </Row>
           </Show>
         </Section>
@@ -737,24 +834,24 @@ function EditChatForm(props: {
 
       <Section>
         <Row clickable={() => {
-          tab.slider.createTab(AppChatAdministratorsTab).open({chatId: chatId()});
+          tab.slider.createTab(hotReloadGuard.tabs.AppChatAdministratorsTab).open({chatId: chatId()});
         }}>
-          <Row.Icon icon="admin" />
+          <Row.Icon icon="admin_filled" />
           <Row.Title>{i18n('PeerInfo.Administrators')}</Row.Title>
           <Row.Subtitle>{administratorsCount()}</Row.Subtitle>
         </Row>
         <Row clickable={() => {
-          tab.slider.createTab(AppChatMembersTab).open(chatId());
+          tab.slider.createTab(hotReloadGuard.tabs.AppChatMembersTab).open(chatId());
         }}>
-          <Row.Icon icon="newgroup" />
+          <Row.Icon icon="newgroup_filled" />
           <Row.Title>{i18n(isBroadcast() ? 'PeerInfo.Subscribers' : 'GroupMembers')}</Row.Title>
           <Row.Subtitle>{membersCount()}</Row.Subtitle>
         </Row>
         <Show when={isChannel()}>
           <Row clickable={() => {
-            tab.slider.createTab(AppRemovedUsersTab).open({chatId: chatId()});
+            tab.slider.createTab(hotReloadGuard.tabs.AppRemovedUsersTab).open({chatId: chatId()});
           }}>
-            <Row.Icon icon="deleteuser" />
+            <Row.Icon icon="person_crossed_filled" />
             <Row.Title>{i18n('ChannelBlockedUsers')}</Row.Title>
             <Row.Subtitle>{removedUsersSubtitle()}</Row.Subtitle>
           </Row>
@@ -763,12 +860,10 @@ function EditChatForm(props: {
 
       <Show when={isBroadcast() && canChangeInfo()}>
         <Section>
-          <Row clickable={(event) => {
-            if(!canToggleAutotranslation()) {
-              showAutotranslationLevelToast();
-              cancelEvent(event);
-            }
-          }}>
+          <Row clickable={!canToggleAutotranslation() ? (event) => {
+            showAutotranslationLevelToast();
+            cancelEvent(event);
+          } : undefined}>
             <Row.CheckboxFieldToggle>
               <CheckboxFieldTsx
                 toggle
@@ -786,24 +881,26 @@ function EditChatForm(props: {
       <Show when={isBroadcast() && canPostMessages()}>
         <Section caption={showProfiles() ? 'ChannelSignProfilesInfo' : 'ChannelSignMessagesInfo'}>
           <Row disabled={signaturesBusy()}>
-            <Row.CheckboxField>
+            <Row.CheckboxFieldToggle>
               <CheckboxFieldTsx
+                toggle
                 signal={[signMessages, setSignMessages]}
                 disabled={signaturesBusy()}
                 onChange={(value) => void toggleSignMessages(value)}
               />
-            </Row.CheckboxField>
+            </Row.CheckboxFieldToggle>
             <Row.Title>{i18n('ChannelSignMessages')}</Row.Title>
           </Row>
           <Show when={signMessages()}>
             <Row disabled={signaturesBusy()}>
-              <Row.CheckboxField>
+              <Row.CheckboxFieldToggle>
                 <CheckboxFieldTsx
+                  toggle
                   signal={[showProfiles, setShowProfiles]}
                   disabled={signaturesBusy()}
                   onChange={(value) => void toggleShowProfiles(value)}
                 />
-              </Row.CheckboxField>
+              </Row.CheckboxFieldToggle>
               <Row.Title>{i18n('ChannelSignMessagesWithProfile')}</Row.Title>
             </Row>
           </Show>
@@ -813,13 +910,14 @@ function EditChatForm(props: {
       <Show when={!isBroadcast() && canChangeType()}>
         <Section>
           <Row disabled={historyBusy()}>
-            <Row.CheckboxField>
+            <Row.CheckboxFieldToggle>
               <CheckboxFieldTsx
+                toggle
                 signal={[showChatHistory, setShowChatHistory]}
                 disabled={historyBusy()}
                 onChange={(value) => void toggleChatHistory(value)}
               />
-            </Row.CheckboxField>
+            </Row.CheckboxFieldToggle>
             <Row.Title>{i18n('ChatHistory')}</Row.Title>
           </Row>
         </Section>
@@ -831,7 +929,7 @@ function EditChatForm(props: {
           communities={props.data.joinedCommunities}
           middleware={tab.middlewareHelper.get()}
           caption="Community.Description"
-          addIcon="newgroup"
+          addIcon="newgroup_filled"
           addText={isBroadcast() ?
             'Community.AddChannel' :
             'Community.AddGroup'}
@@ -839,7 +937,7 @@ function EditChatForm(props: {
             'Community.RemoveChannel' :
             'Community.RemoveGroup'}
           onAdd={() => {
-            tab.slider.createTab(AppAddGroupToCommunityTab).open({peerId: peerId()});
+            tab.slider.createTab(hotReloadGuard.tabs.AppAddGroupToCommunityTab).open({peerId: peerId()});
           }}
           onOpenCommunity={(communityId) => {
             void appDialogsManager.toggleForumTabByPeerId(

@@ -16,7 +16,6 @@ import deferredPromise, {CancellablePromise} from '@helpers/cancellablePromise';
 import App from '@config/app';
 import {MOUNT_CLASS_TO} from '@config/debug';
 import {IDB} from '@lib/files/idb';
-import CryptoWorker from '@lib/crypto/cryptoMessagePort';
 import ctx from '@environment/ctx';
 import noop from '@helpers/noop';
 import Modes from '@config/modes';
@@ -40,6 +39,7 @@ import {getCommonDatabaseState} from '@config/databases/state';
 import {saveEncryptionKeyForHandoff} from '@lib/passcode/keyHandoff';
 import DeferredIsUsingPasscode from '@lib/passcode/deferredIsUsingPasscode';
 import {MTAuthKey} from '@lib/mtproto/authKey';
+import TempAuthKeys, {StoredTempAuthKey} from '@lib/mtproto/tempAuthKeys';
 /**
  * To not be used in an ApiManager instance as there is no account number attached to it
  */
@@ -61,8 +61,10 @@ export class ApiManager extends ApiManagerMethods {
     }
   };
 
-  private cachedExportPromise: {[x: number]: Promise<unknown>};
   private gettingNetworkers: {[dcIdAndType: string]: Promise<MTPNetworker>};
+  // * Perfect Forward Secrecy: temporary keys per DC, and per its media cluster
+  private tempAuthKeys: {[dcIdAndCluster: string]: TempAuthKeys};
+  private droppedTempAuthKeys: boolean;
   private baseDcId: DcId;
 
   private afterMessageTempIds: {
@@ -81,8 +83,8 @@ export class ApiManager extends ApiManagerMethods {
     this.name = 'API';
 
     this.cachedNetworkers = {} as any;
-    this.cachedExportPromise = {};
     this.gettingNetworkers = {};
+    this.tempAuthKeys = {};
     this.baseDcId = 0;
     this.afterMessageTempIds = {};
 
@@ -152,6 +154,29 @@ export class ApiManager extends ApiManagerMethods {
     return transportType;
   }
 
+  // * Sums every live networker of this account; the file DCs are where the big bodies sit.
+  public getMemoryStats() {
+    const total = {
+      networkers: 0,
+      sentMessages: 0,
+      sentMessageBodyBytes: 0,
+      pendingMessages: 0,
+      pendingAcks: 0,
+      sentResendReq: 0,
+      lastServerMessages: 0
+    };
+
+    this.iterateNetworkers(({networker}) => {
+      ++total.networkers;
+      const stats = networker.getMemoryStats();
+      for(const key in stats) {
+        total[key as keyof typeof stats] += stats[key as keyof typeof stats];
+      }
+    });
+
+    return total;
+  }
+
   private iterateNetworkers(callback: (o: {networker: MTPNetworker, dcId: DcId, connectionType: ConnectionType, transportType: TransportType, index: number, array: MTPNetworker[]}) => void) {
     for(const transportType in this.cachedNetworkers) {
       const connections = this.cachedNetworkers[transportType as TransportType];
@@ -174,8 +199,8 @@ export class ApiManager extends ApiManagerMethods {
     }
   }
 
-  private chooseServer(dcId: DcId, connectionType: ConnectionType, transportType: TransportType) {
-    return this.dcConfigurator.chooseServer(dcId, connectionType, transportType, connectionType === 'client', this.rootScope.premium);
+  private chooseServer(dcId: DcId, connectionType: ConnectionType, transportType: TransportType, reuse = connectionType === 'client') {
+    return this.dcConfigurator.chooseServer(dcId, connectionType, transportType, reuse, this.rootScope.premium);
   }
 
   public changeTransportType(transportType: TransportType) {
@@ -216,7 +241,7 @@ export class ApiManager extends ApiManagerMethods {
     }
 
     const accountData = await AccountController.get(this.getAccountNumber());
-    const baseDcId = accountData.dcId;
+    const baseDcId = accountData.dcId || accountData.sign_in_dc_id;
     if(!this.baseDcId) {
       if(!baseDcId) {
         this.setBaseDcId(App.baseDcId);
@@ -240,11 +265,15 @@ export class ApiManager extends ApiManagerMethods {
       userAuth.dcID = baseDcId;
     }
 
-    AccountController.update(this.getAccountNumber(), {
+    // * a sign-in is over once the account is recorded: a tab that switches to it right after reads it
+    await AccountController.update(this.getAccountNumber(), {
       date: (userAuth as UserAuth).date,
       userId: (userAuth as UserAuth).id,
-      dcId: (userAuth as UserAuth).dcID as TrueDcId
+      dcId: (userAuth as UserAuth).dcID as TrueDcId,
+      sign_in_dc_id: undefined
     });
+
+    this.appAccountManager.saveSessionUser();
   }
 
   public setBaseDcId(dcId: DcId) {
@@ -261,8 +290,15 @@ export class ApiManager extends ApiManagerMethods {
 
     this.baseDcId = dcId;
 
-    AccountController.update(this.getAccountNumber(), {
-      dcId: this.baseDcId as TrueDcId
+    // * a slot with a DC is a signed-in account to Web A, which opens it as one: until the sign-in records it
+    // * (setUserAuth), the DC is kept apart, for a sign-in that goes on after a reload
+    AccountController.update(this.getAccountNumber(), (data) => {
+      const dcId = this.baseDcId as TrueDcId;
+      if(data.userId) {
+        return data.dcId === dcId ? undefined : {dcId};
+      }
+
+      return data.sign_in_dc_id === dcId ? undefined : {sign_in_dc_id: dcId};
     });
   }
 
@@ -290,6 +326,15 @@ export class ApiManager extends ApiManagerMethods {
     const clear = async() => {
       if(wasCleared) return;
       wasCleared = true;
+
+      // * a write still on its way would bring the data back after it is gone
+      await AccountController.whenUpdated(accountNumber);
+
+      // * the wallet key never outlives the account on this device
+      const userId = accountData.userId;
+      if(userId) {
+        await import('@lib/wallet/vault').then(({default: WalletVault}) => new WalletVault(userId).wipe()).catch(noop);
+      }
 
       this.baseDcId = undefined;
       // * totalAccounts can be 0 somehow
@@ -349,6 +394,8 @@ export class ApiManager extends ApiManagerMethods {
     .map(accountNumber => AppStoragesManager.clearAllStoresForAccount(accountNumber));
 
     await Promise.all([
+      // * no wallet key outlives the accounts on this device (the per-account logout wipes its own)
+      import('@lib/wallet/vault').then(({default: WalletVault}) => WalletVault.wipeAll()).catch(noop),
       sessionStorage.localStorageProxy('clear'),
       commonStateStorage.clear(),
       EncryptedStorageLayer.getInstance(getCommonDatabaseState(), 'localStorage__encrypted').clear(),
@@ -364,9 +411,8 @@ export class ApiManager extends ApiManagerMethods {
     return [dcId, transportType, connectionType].join('-');
   }
 
-  public async getAuthKeyFromHex(authKeyHex: string) {
-    const authKey = bytesFromHex(authKeyHex);
-    return new MTAuthKey(authKey, (await CryptoWorker.invokeCrypto('sha1', authKey)).slice(-8));
+  public getAuthKeyFromHex(authKeyHex: string) {
+    return MTAuthKey.fromKey(bytesFromHex(authKeyHex));
   }
 
   public getNetworker(dcId: DcId, options: InvokeApiOptions = {}): Promise<MTPNetworker> {
@@ -445,6 +491,10 @@ export class ApiManager extends ApiManagerMethods {
       };
     }
 
+    if(!Modes.pfs) {
+      this.dropTempAuthKeys();
+    }
+
     let transport = this.chooseServer(dcId, connectionType, transportType);
     return this.gettingNetworkers[getKey] = AccountController
     .get(this.getAccountNumber())
@@ -452,8 +502,8 @@ export class ApiManager extends ApiManagerMethods {
     .then(async([authKeyHex, serverSaltHex]) => {
       await ApiManager.fillTimeManagerOffsetPromise;
 
-      let networker: MTPNetworker, error: any, onTransport: () => Promise<any>;
-      let permanent: {authKey?: MTAuthKey, serverSalt?: Uint8Array}, temporary: typeof permanent;
+      let networker: MTPNetworker, error: any;
+      let permanent: {authKey?: MTAuthKey, serverSalt?: Uint8Array};
       if(authKeyHex?.length === 512) {
         if(serverSaltHex?.length !== 16) {
           serverSaltHex = 'AAAAAAAAAAAAAAAA';
@@ -463,11 +513,9 @@ export class ApiManager extends ApiManagerMethods {
           authKey: await this.getAuthKeyFromHex(authKeyHex),
           serverSalt: bytesFromHex(serverSaltHex)
         };
-
-        temporary = await this.authorizer.auth(dcId, true);
       } else {
         try { // if no saved state
-          [permanent, temporary] = await Promise.all([this.authorizer.auth(dcId, false), this.authorizer.auth(dcId, true)]);
+          permanent = await this.authorizer.auth(dcId);
 
           authKeyHex = bytesToHex(permanent.authKey.key);
           serverSaltHex = bytesToHex(permanent.serverSalt);
@@ -482,21 +530,17 @@ export class ApiManager extends ApiManagerMethods {
       }
 
       if(!error) {
-        const auth = temporary ?? permanent;
+        // * with PFS the stored key only binds temporary ones, which do all the talking
+        const tempAuthKeys = Modes.pfs ? this.getTempAuthKeys(dcId, connectionType !== 'client', permanent.authKey) : undefined;
         networker = this.networkerFactory.getNetworker({
           dcId,
           permAuthKey: permanent.authKey,
-          authKey: auth.authKey,
-          serverSalt: auth.serverSalt,
+          authKey: tempAuthKeys ? undefined : permanent.authKey,
+          serverSalt: tempAuthKeys ? undefined : permanent.serverSalt,
+          tempAuthKeys,
           isFileDownload: connectionType === 'download',
           isFileUpload: connectionType === 'upload'
         });
-
-        if(temporary) onTransport = async() => {
-          await networker.wrapBindAuthKeyCall(temporary.authKey.expiresAt);
-          // await networker.wrapApiCall('help.getConfig', {});
-          // await pause(1000000);
-        };
       }
 
       // ! cannot get it before this promise because simultaneous changeTransport will change nothing
@@ -525,7 +569,6 @@ export class ApiManager extends ApiManagerMethods {
       }
 
       this.changeNetworkerTransport(networker, transport);
-      // onTransport && await onTransport?.();
       networkers.unshift(networker);
       this.setOnDrainIfNeeded(networker);
       return networker;
@@ -534,6 +577,64 @@ export class ApiManager extends ApiManagerMethods {
 
   public getNetworkerVoid(dcId: DcId) {
     return this.getNetworker(dcId).then(noop, noop);
+  }
+
+  /**
+   * @param media the file connections go to the media cluster of the DC,
+   * which knows nothing of the temporary keys of the main one (-404)
+   */
+  private getTempAuthKeys(dcId: DcId, media: boolean, permAuthKey: MTAuthKey) {
+    const connectionType: ConnectionType = media ? 'download' : 'client';
+    const key = `${dcId}${media ? '-media' : ''}`;
+    return this.tempAuthKeys[key] ??= new TempAuthKeys({
+      permAuthKey,
+      timeManager: this.timeManager,
+      log: this.createLogger(`PFS-${key}`),
+      createTransport: () => this.chooseServer(dcId, connectionType, this.getTransportType(connectionType), false),
+      authTemp: (transport, expiresIn) => this.authorizer.authTemp(dcId, media, transport, expiresIn),
+      createNetworker: (options) => this.networkerFactory.getHelperNetworker({
+        ...options,
+        dcId,
+        serverSalt: options.authKey.serverSalt
+      }),
+      load: async() => (await AccountController.get(this.getAccountNumber())).temp_auth_keys?.[key],
+      store: (stored) => this.storeTempAuthKey(key, stored)
+    });
+  }
+
+  // * Kept in the account's data next to the permanent keys they are bound to: encrypted with them
+  // * under a passcode, and gone with them at log out
+  private storeTempAuthKey(key: string, stored: StoredTempAuthKey) {
+    AccountController.update(this.getAccountNumber(), (data) => {
+      // * nothing is written for an account that is logging out, nor while the accounts move to
+      // * other slots after a log out - this one may no longer be in its own
+      if(this.loggingOut || AccountController.shifting) {
+        return;
+      }
+
+      const keys = {...data.temp_auth_keys};
+      if(stored) {
+        keys[key] = stored;
+      } else {
+        delete keys[key];
+      }
+
+      return {temp_auth_keys: keys};
+    }).catch((err) => {
+      this.log.error('can\'t keep temporary auth key', err);
+    });
+  }
+
+  // * with PFS off (?noPfs=1) the kept keys have no use, and are not kept
+  private dropTempAuthKeys() {
+    if(this.droppedTempAuthKeys) {
+      return;
+    }
+
+    this.droppedTempAuthKeys = true;
+    AccountController.update(this.getAccountNumber(), (data) => {
+      return !this.loggingOut && !AccountController.shifting && data.temp_auth_keys ? {temp_auth_keys: undefined} : undefined;
+    }).catch(noop);
   }
 
   private changeNetworkerTransport(networker: MTPNetworker, transport?: MTTransport) {
@@ -590,9 +691,11 @@ export class ApiManager extends ApiManagerMethods {
 
     let {afterMessageId, prepareTempMessageId} = options;
     if(prepareTempMessageId) {
-      deferred.then(() => {
+      // * whichever way it went: one that failed is waited for no more (MSG_WAIT_FAILED below)
+      const forget = () => {
         delete this.afterMessageTempIds[prepareTempMessageId];
-      });
+      };
+      deferred.then(forget, forget);
     }
 
     if(MOUNT_CLASS_TO) {
@@ -682,24 +785,27 @@ export class ApiManager extends ApiManagerMethods {
           }
           throw error;
         } else if(error.code === 401 && this.baseDcId && dcId !== this.baseDcId) {
-          if(this.cachedExportPromise[dcId] === undefined) {
-            const promise = new Promise((exportResolve, exportReject) => {
-              this.invokeApi('auth.exportAuthorization', {dc_id: dcId}, {noErrorBox: true}).then((exportedAuth) => {
-                this.invokeApi('auth.importAuthorization', {
-                  id: exportedAuth.id,
-                  bytes: exportedAuth.bytes
-                }, {dcId, noErrorBox: true}).then(exportResolve, exportReject);
-              }, exportReject);
-            });
-
-            this.cachedExportPromise[dcId] = promise;
-          }
-
-          return this.cachedExportPromise[dcId].then(() => performRequest());
+          // * the home DC's authorization imported once for the requests that hit 401 meanwhile, and anew for the next
+          // * 401 (as tdesktop's _authWaiters): kept for the session instead, one failed import would fail every later
+          // * request there, and a DC that has dropped the authorization since would send them round in circles
+          return this.invokeApiSingleProcess({
+            method: 'auth.exportAuthorization',
+            params: {dc_id: dcId},
+            options: {noErrorBox: true},
+            processResult: (exportedAuth) => {
+              return this.invokeApi('auth.importAuthorization', {
+                id: exportedAuth.id,
+                bytes: exportedAuth.bytes
+              }, {dcId, noErrorBox: true});
+            }
+          }).then(() => performRequest());
         } else if(error.code === 303) {
-          const newDcId = +error.type.match(/^(PHONE_MIGRATE_|NETWORK_MIGRATE_|USER_MIGRATE_|STATS_MIGRATE_)(\d+)/)[2] as DcId;
-          if(newDcId !== dcId) {
-            if(options.dcId) {
+          // * a 303 of a kind not listed here is an ordinary error, as in tdesktop's onErrorDefault; FILE_MIGRATE comes
+          // * as a 303 too (payments.getBankCardData), and moves only the request, as its 400 below does
+          const match = error.type.match(/^(PHONE_MIGRATE_|NETWORK_MIGRATE_|USER_MIGRATE_|STATS_MIGRATE_|FILE_MIGRATE_)(\d+)/);
+          const newDcId = match && +match[2] as DcId;
+          if(newDcId && newDcId !== dcId) {
+            if(options.dcId || match[1] === 'FILE_MIGRATE_') {
               options.dcId = newDcId;
             } else {
               this.setBaseDcId(newDcId);
@@ -707,6 +813,8 @@ export class ApiManager extends ApiManagerMethods {
 
             return this.invokeApi(method, params, options);
           }
+
+          throw error;
         } else if(error.code === 400 && error.type.indexOf('FILE_MIGRATE') === 0) {
           const newDcId = +error.type.match(/^(FILE_MIGRATE_)(\d+)/)[2] as DcId;
           if(newDcId !== dcId) {
@@ -757,9 +865,15 @@ export class ApiManager extends ApiManagerMethods {
           afterMessageId = undefined;
           delete options.afterMessageId;
 
-          if(after) return after.promise.then(() => performRequest());
+          // * sent on its own once the one it waited for is over, whichever way it went, as tdesktop resends it: taken
+          // * down with the one before, a text sent right after a sticker the chat refuses failed with its error
+          if(after) return after.promise.then(() => performRequest(), () => performRequest());
           else return performRequest();
         } else if(!options.rawError && error.code === 500) {
+          if(options.noRetry) {
+            throw error;
+          }
+
           const now = Date.now();
           if(options.stopTime) {
             if(now >= options.stopTime) {
@@ -769,7 +883,7 @@ export class ApiManager extends ApiManagerMethods {
 
           options.waitTime = options.waitTime ? Math.min(60, options.waitTime * 1.5) : 1;
           return pause(options.waitTime * 1000).then(() => performRequest());
-        } else if(error.type === 'UNKNOWN' || error.type === 'MTPROTO_CLUSTER_INVALID') { // cluster invalid - request from regular user to premium endpoint
+        } else if((error.type === 'UNKNOWN' && !options.noRetry) || error.type === 'MTPROTO_CLUSTER_INVALID') { // cluster invalid - request from regular user to premium endpoint
           return pause(1000).then(() => performRequest());
         } else {
           if(RepayRequestHandler.canHandleError(error))

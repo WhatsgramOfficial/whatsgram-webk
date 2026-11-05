@@ -3,7 +3,7 @@ import {batch, createEffect, createResource, createSignal, For, onCleanup, onMou
 import wrapEmojiText from '@lib/richTextProcessor/wrapEmojiText';
 import {useHotReloadGuard} from '@lib/solidjs/hotReloadGuard';
 import {Document, EmojiGroup, StickerSet} from '@layer';
-import {i18n} from '@lib/langPack';
+import I18n, {i18n} from '@lib/langPack';
 
 import SuperStickerRenderer from '@components/emoticonsDropdown/tabs/SuperStickerRenderer';
 import createMiddleware from '@helpers/solid/createMiddleware';
@@ -19,6 +19,9 @@ import {delay} from '@components/mediaEditor/utils';
 
 import {TabContentContext} from '@components/mediaEditor/tabs/tabContent';
 import {getStickerSetInputById} from '@lib/appManagers/utils/stickers/getStickerSetInput';
+import A11yButton from '@components/a11yButton';
+import smoothScrollBehavior from '@helpers/dom/smoothScrollBehavior';
+import createStickersSearch from '@components/emoticonsDropdown/stickersSearch';
 
 export default function StickersTab() {
   const {wrapStickerSetThumb, EmoticonsSearch} = useHotReloadGuard();
@@ -59,7 +62,7 @@ export default function StickersTab() {
     setActiveSet(String(id));
     setScrolling(true);
     container()?.querySelector(`[data-set-id="${id}"]`)?.scrollIntoView({
-      behavior: 'smooth',
+      behavior: smoothScrollBehavior(),
       block: 'start'
     });
     await delay(1000);
@@ -67,7 +70,7 @@ export default function StickersTab() {
   }
 
   function StickerSetThumb(props: {set: StickerSet.stickerSet}) {
-    let renderContainer: HTMLDivElement;
+    let renderContainer: HTMLElement;
 
 
     onMount(() => {
@@ -90,19 +93,21 @@ export default function StickersTab() {
     const isActive = () => String(props.set.id) === activeSet();
 
     return (
-      <div
-        ref={renderContainer}
+      <A11yButton
+        ref={(el: HTMLElement) => renderContainer = el}
         class="media-editor__stickers-set-thumb"
         classList={{
           'media-editor__stickers-set-thumb--active': isActive()
         }}
+        aria-label={props.set.title}
+        aria-pressed={isActive()}
         onClick={() => onStickerSetThumbClick(String(props.set.id))}
       />
     );
   }
 
   function Sticker(props: {doc: Document.document}) {
-    let container: HTMLDivElement;
+    let container: HTMLElement;
 
     onMount(() => {
       stickerRenderer.renderSticker(props.doc, container);
@@ -136,7 +141,16 @@ export default function StickersTab() {
       });
     }
 
-    return <div ref={container} class="media-editor__stickers-grid-item" onClick={onClick} />;
+    const label = () => props.doc.stickerEmojiRaw || I18n.format('AttachSticker', true);
+
+    return (
+      <A11yButton
+        ref={(el: HTMLElement) => container = el}
+        class="media-editor__stickers-grid-item"
+        aria-label={label()}
+        onClick={onClick}
+      />
+    );
   }
 
   function StickerSetLabel(props: {set: StickerSet.stickerSet}) {
@@ -176,7 +190,7 @@ export default function StickersTab() {
     let thumbsListScrollable: HTMLDivElement;
 
     onMount(() => {
-      document.querySelector('.media-editor__tabs')?.append(thumbsListScrollable);
+      thumbsListScrollable.ownerDocument.querySelector('.media-editor__tabs')?.append(thumbsListScrollable);
       new ScrollableX(thumbsListScrollable);
     });
     onCleanup(() => {
@@ -192,17 +206,23 @@ export default function StickersTab() {
       }}
       ref={thumbsListScrollable}
     >
-      <div class="media-editor__stickers-thumb-list">
+      <div
+        class="media-editor__stickers-thumb-list"
+        role="group"
+        aria-label={I18n.format('MediaEditor.StickerSets', true)}
+      >
         <Show when={recentStickers()?.length}>
-          <div
+          <A11yButton
             class="media-editor__stickers-recent-button"
             classList={{
               'media-editor__stickers-recent-button--active': activeSet() === 'recent'
             }}
+            aria-label={I18n.format('MediaEditor.RecentlyUsed', true)}
+            aria-pressed={activeSet() === 'recent'}
             onClick={() => onStickerSetThumbClick('recent')}
           >
-            <IconTsx icon="recent" />
-          </div>
+            <IconTsx icon="recent" aria-hidden={true} />
+          </A11yButton>
         </Show>
         <For each={stickerSets()?.sets}>{(set) => <StickerSetThumb set={set} />}</For>
       </div>
@@ -242,29 +262,45 @@ export default function StickersTab() {
     }
   });
 
-  createEffect(async() => {
-    if(search()) {
-      setFilteredStickers(await managers.appStickersManager.searchStickers(search()));
+  let filteredEnd: HTMLDivElement;
+  createEffect(() => {
+    const query = search();
+    const g = !query && group();
+    if(!query && !g) {
+      setFilteredStickers();
       return;
     }
-    if(group()) {
-      const g = group();
-      if(g._ === 'emojiGroupPremium') {
-        setFilteredStickers(await managers.appStickersManager.getPremiumStickers());
-        return;
-      }
-      setFilteredStickers(
-        await managers.appStickersManager.getStickersByEmoticon({
+
+    // * an answer for a query or a group already left behind must not land
+    let active = true;
+    onCleanup(() => active = false);
+
+    if(g) {
+      const promise = g._ === 'emojiGroupPremium' ?
+        managers.appStickersManager.getPremiumStickers() :
+        managers.appStickersManager.getStickersByEmoticon({
           emoticon: g.emoticons,
           includeServerStickers: true
-        })
-      );
-
+        });
+      promise.then((stickers) => active && setFilteredStickers(stickers));
       return;
     }
-    if(!group() && !search()) {
-      setFilteredStickers();
-    }
+
+    // * the user's own stickers first, then the server's, page by page as the grid is scrolled on
+    const stickersSearch = createStickersSearch(managers, query);
+    onCleanup(stickersSearch.destroy);
+    stickersSearch.local().then(stickersSearch.first).then((stickers) => {
+      if(!active) {
+        return;
+      }
+
+      setFilteredStickers(stickers);
+      stickersSearch.paginate(filteredEnd, container(), (more) => {
+        if(active) {
+          setFilteredStickers((stickers) => [...stickers, ...more]);
+        }
+      });
+    });
   });
 
   return (
@@ -305,6 +341,7 @@ export default function StickersTab() {
         <div class="media-editor__stickers-grid">
           <For each={filteredStickers()}>{(doc) => <Sticker doc={doc} />}</For>
         </div>
+        <div ref={filteredEnd} />
       </Show>
 
       <Show when={stickerSets() && !filteredStickers()}>

@@ -1,4 +1,5 @@
 import type LazyLoadQueue from '@components/lazyLoadQueue';
+import isAnchoredEphemeralMessage from '@appManagers/utils/messages/isAnchoredEphemeralMessage';
 import {formatDate, formatFullSentTimeRaw, formatTime} from '@helpers/date';
 import {getFullDate} from '@helpers/date/getFullDate';
 import setInnerHTML from '@helpers/dom/setInnerHTML';
@@ -30,6 +31,7 @@ import numberThousandSplitter, {numberThousandSplitterForStars} from '@helpers/n
 import {makeTime} from '@components/chat/utils';
 import {useAppConfig} from '@stores/appState';
 import {formatNanoton} from '@helpers/paymentsWrapCurrencyAmount';
+import {bindManagersToSession} from '@lib/accounts/bindManagersToAccount';
 
 const NBSP = '&nbsp;';
 
@@ -59,6 +61,15 @@ const makeEdited = () => {
   return edited;
 };
 
+// layer 229: an ordinary message an ephemeral one is standing in for says "updated" where an
+// edited one would say "edited" (tdesktop's `Data::Flag::Updated`).
+const makeUpdated = () => {
+  const updated = document.createElement('i');
+  updated.classList.add('time-edited', 'time-part');
+  _i18n(updated, 'Ephemeral.Updated');
+  return updated;
+};
+
 // * when the `message_primary_edited_date` app config flag is on, the edited badge is
 // * replaced by the actual edit time ("edited at HH:MM" / "edited on <date> at HH:MM")
 // * shown in place of the sent time — matches tdesktop's EditedPrimary behaviour.
@@ -83,6 +94,7 @@ const makeEffect = (props: {
   middleware?: Middleware,
   loadPromises?: Promise<any>[]
 }) => {
+  const managers = bindManagersToSession(rootScope.managers);
   const span = document.createElement('span');
   span.classList.add('time-effect');
   if(props.onlyElement) {
@@ -93,7 +105,7 @@ const makeEffect = (props: {
 
   span.dataset.effectId = '' + props.docId;
 
-  rootScope.managers.acknowledged.appReactionsManager.getAvailableEffect(props.docId)
+  managers.acknowledged.appReactionsManager.getAvailableEffect(props.docId)
   .then(async(result) => {
     if(!result.cached) {
       deferred.resolve();
@@ -107,7 +119,7 @@ const makeEffect = (props: {
 
     const loadPromises: Promise<any>[] = [];
     wrapSticker({
-      doc: await rootScope.managers.appDocsManager.getDoc(availableEffect.static_icon_id),
+      doc: await managers.appDocsManager.getDoc(availableEffect.static_icon_id),
       div: span,
       middleware: props.middleware,
       loadPromises,
@@ -159,10 +171,12 @@ export const fireMessageEffect = ({e, isOut, element, middleware, scrollable, ef
     const {doc, thumb: fullThumb} = await getDocForEffect(availableEffect);
     if(!middleware()) return;
 
+    // * the effect flies from the message's side of the chat toward the middle; RTL swaps the sides
+    const isOnRight = !!isOut !== I18n.getIsRTL();
     const {animationDiv} = wrapStickerAnimation({
       doc,
       middleware,
-      side: isOut ? 'right' : 'left',
+      side: isOnRight ? 'right' : 'left',
       size: 240,
       target: element,
       play: true,
@@ -174,7 +188,7 @@ export const fireMessageEffect = ({e, isOut, element, middleware, scrollable, ef
       }
     });
 
-    if(isOut === false) {
+    if(isOut !== undefined && !isOnRight) {
       animationDiv.classList.add('reflect-x');
     }
   });
@@ -200,6 +214,9 @@ export const fireMessageEffectByBubble = ({timeEffect, bubble, e, scrollable}: {
 };
 
 // const makeSponsored = () => i18n('SponsoredMessage');
+
+// * the refreshes of a bubble's reply quote asked for: the one put in is the one asked for last, whichever comes first
+const replyRefreshes: WeakMap<HTMLElement, number> = new WeakMap();
 
 export namespace MessageRender {
   /* export const setText = () => {
@@ -265,7 +282,7 @@ export namespace MessageRender {
         span.classList.add('time-dice');
         span.textContent = formatNanoton(messageMedia.game_outcome.stake_ton_amount);
 
-        const icon = Icon('ton', 'time-icon', 'time-part');
+        const icon = Icon('gram_filled', 'time-icon', 'time-part');
 
         args.push(span, icon);
       }
@@ -275,7 +292,7 @@ export namespace MessageRender {
         postViewsSpan.classList.add('post-views');
         postViewsSpan.textContent = formatNumber(message.views, 1);
 
-        const channelViews = Icon('channelviews', 'time-icon', 'time-part', 'time-icon-views');
+        const channelViews = Icon('channelviews_filled', 'time-icon', 'time-part', 'time-icon-views');
 
         title += '\n' + I18n.format('ViewsTooltip', true, [numberThousandSplitter(message.views)]);
         if(message.forwards) {
@@ -305,7 +322,9 @@ export namespace MessageRender {
         args.push(span);
       }
 
-      if(!editedPrimary && message.edit_date && chatType !== ChatType.Scheduled && !message.pFlags.edit_hide) {
+      if(isAnchoredEphemeralMessage(message)) {
+        args.unshift(editedSpan = makeUpdated());
+      } else if(!editedPrimary && message.edit_date && chatType !== ChatType.Scheduled && !message.pFlags.edit_hide) {
         args.unshift(editedSpan = makeEdited());
       }
 
@@ -363,7 +382,9 @@ export namespace MessageRender {
 
     let clonedArgs = args;
     if(editedSpan) {
-      clonedArgs[clonedArgs.indexOf(editedSpan)] = makeEdited();
+      clonedArgs[clonedArgs.indexOf(editedSpan)] = isAnchoredEphemeralMessage(message) ?
+        makeUpdated() :
+        makeEdited();
     }
     // if(sponsoredSpan) {
     //   clonedArgs[clonedArgs.indexOf(sponsoredSpan)] = makeSponsored();
@@ -414,8 +435,9 @@ export namespace MessageRender {
   }) => {
     const isFooter = !bubble.classList.contains('sticker') &&
       !bubble.classList.contains('emoji-big') &&
-      !bubble.classList.contains('round');
-    const repliesFooter = new RepliesElement();
+      !bubble.classList.contains('round') &&
+      !bubble.classList.contains('is-unsupported');
+    const repliesFooter = RepliesElement.create();
     repliesFooter.message = message;
     repliesFooter.type = isFooter ? 'footer' : 'beside';
     repliesFooter.loadPromises = loadPromises;
@@ -426,7 +448,7 @@ export namespace MessageRender {
     return isFooter;
   };
 
-  export const setReply = async({chat, bubble, bubbleContainer, message, logId, appendCallback, middleware, lazyLoadQueue, needUpdate, isStandaloneMedia, isOut, fromUpdate}: {
+  export const setReply = async({chat, bubble, bubbleContainer, message, logId, appendCallback, middleware, lazyLoadQueue, needUpdate, isStandaloneMedia, isOut, fromUpdate, swap = (callback) => callback()}: {
     chat: Chat,
     bubble: HTMLElement,
     bubbleContainer?: HTMLElement,
@@ -438,14 +460,19 @@ export namespace MessageRender {
     needUpdate: ChatBubbles['needUpdate'],
     isStandaloneMedia: boolean,
     isOut: boolean,
-    fromUpdate?: boolean
+    fromUpdate?: boolean,
+    /** puts the quote made in place of the one shown: at once, or as a change of the bubble the caller shows */
+    swap?: (callback: () => void) => void
   }) => {
+    const managers = bindManagersToSession(rootScope.managers);
     const isReplacing = !bubbleContainer;
     if(isReplacing) {
       bubbleContainer = bubble.querySelector('.bubble-content');
     }
 
     const currentReplyDiv = isReplacing ? bubbleContainer.querySelector('.reply') as HTMLElement : null;
+    const refresh = (replyRefreshes.get(bubble) ?? 0) + 1;
+    if(currentReplyDiv) replyRefreshes.set(bubble, refresh);
     const replyTo = message.reply_to;
     if(!replyTo) {
       currentReplyDiv?.remove();
@@ -464,7 +491,7 @@ export namespace MessageRender {
       );
 
     const originalMessage = !isStoryReply && apiManagerProxy.getMessageByPeer(replyToPeerId, message.reply_to_mid);
-    const originalStory = isStoryReply && await rootScope.managers.acknowledged.appStoriesManager.getStoryById(replyToPeerId, replyTo.story_id);
+    const originalStory = isStoryReply && await managers.acknowledged.appStoriesManager.getStoryById(replyToPeerId, replyTo.story_id);
     let originalPeerTitle: string | HTMLElement | DocumentFragment;
 
     let isReplyFromAnotherPeer = false;
@@ -484,7 +511,7 @@ export namespace MessageRender {
 
     if(isStoryReply) {
       if(!originalStory.cached) {
-        rootScope.managers.appMessagesManager.fetchMessageReplyTo(message);
+        managers.appMessagesManager.fetchMessageReplyTo(message);
         // needUpdate.push(forUpdate = {replyToPeerId, replyStoryId: replyTo.story_id, mid: message.mid, peerId: message.peerId});
         originalPeerTitle = i18n('Loading');
       } else {
@@ -512,7 +539,7 @@ export namespace MessageRender {
         originalPeerTitle = i18n('DeletedMessage');
       } else {
         // needUpdate.push(forUpdate = {replyToPeerId, replyMid: message.reply_to_mid, mid: message.mid, peerId: message.peerId});
-        rootScope.managers.appMessagesManager.fetchMessageReplyTo(message);
+        managers.appMessagesManager.fetchMessageReplyTo(message);
 
         originalPeerTitle = i18n('Loading');
       }
@@ -586,19 +613,26 @@ export namespace MessageRender {
 
     await fillPromise;
     if(currentReplyDiv) {
-      const saveClassNames = ['floating-part', 'mb-shorter'];
-      const classList = currentReplyDiv.classList;
-      saveClassNames.forEach((className) => {
-        if(classList.contains(className)) {
-          container.classList.add(className);
-        }
+      swap(() => {
+        // * the quote shown by then: another refresh, asked for earlier, put in its own in place of the one this one
+        // * started from; one asked for later puts in its own
+        if(replyRefreshes.get(bubble) !== refresh) return;
+        const shown = bubbleContainer.querySelector<HTMLElement>('.reply') ?? currentReplyDiv;
+        const saveClassNames = ['floating-part', 'mb-shorter'];
+        const classList = shown.classList;
+        saveClassNames.forEach((className) => {
+          if(classList.contains(className)) {
+            container.classList.add(className);
+          }
+        });
+        shown.replaceWith(container);
+        bubble.classList.add('is-reply');
       });
-      currentReplyDiv.replaceWith(container);
     } else {
       appendCallback(container);
+      // bubbleContainer.insertBefore(, nameContainer);
+      bubble.classList.add('is-reply');
     }
-    // bubbleContainer.insertBefore(, nameContainer);
-    bubble.classList.add('is-reply');
 
     return container;
   };

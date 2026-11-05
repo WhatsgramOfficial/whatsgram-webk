@@ -18,6 +18,9 @@ import {MyDocument} from '@appManagers/appDocsManager';
 import {simulateClickEvent} from '@helpers/dom/clickEvent';
 import formatNumber from '@helpers/number/formatNumber';
 import {getCollectibleName} from '@appManagers/utils/gifts/getCollectibleName';
+import buttonKeyDown from '@helpers/solid/buttonKeyDown';
+import Modes from '@config/modes';
+import I18n from '@lib/langPack';
 
 export function StarGiftBubble(props: {
   gift: MyStarGift
@@ -73,6 +76,15 @@ export function StarGiftBubble(props: {
       return <I18nTsx key="StarGiftDefaultMessageUpgrade" />
     }
 
+    if(props.gift.isConverted && props.gift.isIncoming) {
+      return (
+        <I18nTsx
+          key="StarGiftGotStars"
+          args={`${props.gift.raw.convert_stars}`}
+        />
+      );
+    }
+
     if(props.gift.raw.convert_stars !== undefined && !props.gift.isUpgraded) {
       return props.gift.isIncoming ? (
         <I18nTsx
@@ -83,8 +95,8 @@ export function StarGiftBubble(props: {
         <I18nTsx
           key="StarGiftDefaultMessageConvertableOut"
           args={[
-            <PeerTitleTsx peerId={props.ownerId} />,
-            `${props.gift.raw.convert_stars}`
+            `${props.gift.raw.convert_stars}`,
+            <PeerTitleTsx peerId={props.ownerId} />
           ]}
         />
       );
@@ -151,7 +163,7 @@ export function StarGiftBubble(props: {
         <Button
           class={/* @once */ classNames('bubble-service-button', styles.upgradeButton)}
           onClick={props.onViewClick}
-          iconAfter="unpack"
+          iconAfter="unpack_filled"
         >
           <Sparkles mode="button" isDiv />
           <I18nTsx key="ActionGiftPremiumUnpack" />
@@ -176,7 +188,11 @@ export function UniqueStarGiftWebPageBox(props: {
   return (
     <div
       class={/* @once */ styles.webPageBox}
+      role="button"
+      tabindex={Modes.a11y ? 0 : undefined}
+      aria-label={/* @once */ I18n.format('ActionGiftPremiumView', true)}
       onClick={(evt) => simulateClickEvent(evt.target.closest('.webpage-quote'))}
+      onKeyDown={buttonKeyDown}
     >
       <StarGiftBackdrop
         class={/* @once */ styles.webPageBackdrop}

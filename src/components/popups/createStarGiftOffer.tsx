@@ -1,11 +1,10 @@
 import PopupElement, {createPopup} from '@components/popups/indexTsx';
-import {createEffect, createMemo, createSignal, on, onMount, Show} from 'solid-js';
+import {createEffect, createMemo, createSignal, on, Show} from 'solid-js';
 import {MyStarGift} from '@appManagers/appGiftsManager';
 import {i18n, LangPackKey} from '@lib/langPack';
 import Row from '@components/rowTsx';
 import CheckboxFieldTsx from '@components/checkboxFieldTsx';
 import {InputFieldTsx} from '@components/inputFieldTsx';
-import {fastRaf} from '@helpers/schedulers';
 import paymentsWrapCurrencyAmount, {formatNanoton, parseNanotonFromDecimal} from '@helpers/paymentsWrapCurrencyAmount';
 import Section from '@components/section';
 import rootScope from '@lib/rootScope';
@@ -16,7 +15,6 @@ import {STARS_CURRENCY, TON_CURRENCY} from '@appManagers/constants';
 import {ChipTab, ChipTabs} from '@components/chipTabs';
 import {StarGift, StarsAmount} from '@layer';
 import bigInt from 'big-integer';
-import PopupElementOld from './index'
 import styles from '@components/popups/createStarGiftOffer.module.scss';
 import {StarGiftPriceInputField} from '@components/stargifts/stargiftPriceInputField';
 import {getCollectibleName} from '@appManagers/utils/gifts/getCollectibleName';
@@ -25,13 +23,15 @@ import {PeerTitleTsx} from '@components/peerTitleTsx';
 import wrapPeerTitle from '@components/wrappers/peerTitle';
 import getPeerId from '@appManagers/utils/peers/getPeerId';
 import {FloatingStarsBalance} from './floatingStarsBalance';
-import PopupStars from './stars';
 import formatStarsAmount from '../../lib/appManagers/utils/payments/formatStarsAmount';
+import {hotReloadGuard} from '@lib/solidjs/hotReloadGuardProvider';
+import {bindManagersToSession} from '@lib/accounts/bindManagersToAccount';
 
 export async function showCreateStarGiftOfferPopup(options: {
   gift: MyStarGift
   onFinish?: (result: 'created' | 'cancel') => void
 }) {
+  const managers = bindManagersToSession(rootScope.managers);
   const gift = options.gift.raw as StarGift.starGiftUnique;
   const peerTitle = await wrapPeerTitle({peerId: getPeerId(gift.owner_id), onlyFirstName: true})
   const [show, setShow] = createSignal(true);
@@ -57,12 +57,6 @@ export async function showCreateStarGiftOfferPopup(options: {
     let inputRef!: HTMLElement;
     let durationRowRef!: HTMLElement;
 
-    onMount(() => {
-      fastRaf(() => {
-        inputRef.focus();
-      });
-    });
-
     const handleSubmit = async() => {
       const starsAmount: StarsAmount = ton() ? {
         _: 'starsTonAmount',
@@ -85,7 +79,7 @@ export async function showCreateStarGiftOfferPopup(options: {
         options.onFinish?.('created')
       } catch(err) {
         if((err as ApiError).type === 'BALANCE_TOO_LOW') {
-          PopupElementOld.createPopup(PopupStars, {
+          hotReloadGuard.showStarsPopup({
             itemPrice: starsAmount.amount,
             ton: ton(),
             onTopup: async() => {
@@ -143,9 +137,10 @@ export async function showCreateStarGiftOfferPopup(options: {
 
     return (
       <PopupElement
+        managers={managers}
         class={styles.popup}
-        containerClass={styles.popupContainer}
-        show={show()}
+          show={show()}
+        initialFocus={() => inputRef}
         closable={true}
         onClose={() => {
           if(!isCreated) {
@@ -154,7 +149,7 @@ export async function showCreateStarGiftOfferPopup(options: {
         }}
       >
         <FloatingStarsBalance class={styles.balance} ton={ton()} />
-        <PopupElement.Header class={styles.popupHeader}>
+        <PopupElement.Header>
           <PopupElement.CloseButton />
           <PopupElement.Title>
             <I18nTsx key="StarGiftOffer.CreateOfferTitle" />
@@ -215,7 +210,7 @@ export async function showCreateStarGiftOfferPopup(options: {
             </Row>
           </Section>
         </PopupElement.Body>
-        <PopupElement.Footer class={styles.popupFooter}>
+        <PopupElement.Footer>
           <PopupElement.FooterButton
             disabled={!offerAmount() || inputError() !== undefined}
             callback={handleSubmit}

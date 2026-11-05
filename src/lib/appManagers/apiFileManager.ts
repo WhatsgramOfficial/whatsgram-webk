@@ -312,6 +312,28 @@ export class ApiFileManager extends AppManager {
     this.queueId = queueId;
   }
 
+  // * The download side of the worker's footprint, per account. The whole-file buffers those
+  // * downloads hold are process-wide, so memoryStats adds them once, not once per account.
+  public getMemoryStats() {
+    let queuedPulls = 0, activeDownloads = 0;
+    for(const dcId in this.downloadPulls) {
+      queuedPulls += this.downloadPulls[dcId].length;
+    }
+
+    for(const dcId in this.downloadActives) {
+      activeDownloads += this.downloadActives[dcId];
+    }
+
+    return {
+      downloadPromises: Object.keys(this.downloadPromises).length,
+      uploadPromises: Object.keys(this.uploadPromises).length,
+      queuedPulls,
+      activeDownloads,
+      filePartReferences: this.requestFilePartReferences.size,
+      refreshReferencePromises: Object.keys(this.refreshReferencePromises).length
+    };
+  }
+
   private getFileStorage() {
     return this.cacheStorage;
   }
@@ -327,7 +349,8 @@ export class ApiFileManager extends AppManager {
       }
     }
 
-    return canceled;
+    // a rich message's media past its bytes is still uploading: the messages manager gives it up
+    return canceled || !!this.appMessagesManager?.cancelPreparedRichMessageMedia(fileName);
   }
 
   public cancelDownloadByReference(reference: ReferenceBytes) {
@@ -890,7 +913,7 @@ export class ApiFileManager extends AppManager {
       let _writePromise: CancellablePromise<void> = Promise.resolve(),
         _offset = 0;
       const superpuper = async() => {
-        if(_offset && _offset > size) {
+        if(_offset && _offset >= size) { // * a file of a whole number of parts has nothing past its last one
           return;
         }
 
@@ -934,12 +957,15 @@ export class ApiFileManager extends AppManager {
               superpuper();
               throttledDispatchProgress();
             }
+          }
 
-            const writeQueuePerf = performance.now();
-            await writePromise;
-            checkCancel();
-            const writeQueueTime = performance.now() - writeQueuePerf;
+          // * an empty part past the end finishes the file too, so it waits for every part before it as well
+          const writeQueuePerf = performance.now();
+          await writePromise;
+          checkCancel();
+          const writeQueueTime = performance.now() - writeQueuePerf;
 
+          if(byteLength) {
             const perf = performance.now();
             await Promise.all(prepared.map(({writer}) => writer?.write(bytes, offset)));
             checkCancel();
@@ -1085,6 +1111,12 @@ export class ApiFileManager extends AppManager {
       return deferred;
     }
 
+    // * no bytes, no part to send (the server takes no empty one), and nothing would ever settle the upload
+    if(!fileSize && !DO_NOT_UPLOAD_FILES) {
+      deferred.reject(makeError('FILE_EMPTY'));
+      return deferred;
+    }
+
     let canceled = false, resolved = false;
     let errorHandler = (error: ApiError) => {
       if(error?.type !== 'UPLOAD_CANCELED') {
@@ -1165,6 +1197,7 @@ export class ApiFileManager extends AppManager {
     };
 
     deferred.notify = (progress: Progress) => {
+      deferred.notifyAll(progress); // * the message it is sent with tells the chat that a file is being sent
       this.rootScope.dispatchEvent('download_progress', progress);
     };
 

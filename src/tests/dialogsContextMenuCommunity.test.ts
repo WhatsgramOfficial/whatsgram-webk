@@ -12,7 +12,10 @@ const mocks = vi.hoisted(() => ({
   isDialogUnread: vi.fn(),
   isPeerLocalMuted: vi.fn(),
   getDialogFilters: vi.fn(),
-  getDeleteButtonText: vi.fn()
+  getDeleteButtonText: vi.fn(),
+  blockUserWithConfirmation: vi.fn(),
+  unblockUser: vi.fn(),
+  isUserKnownBlocked: vi.fn()
 }));
 
 vi.mock('@helpers/dom/createContextMenu', () => ({
@@ -28,8 +31,14 @@ vi.mock('@lib/appDialogsManager', () => ({
   default: {
     filterId: 0,
     openDialogInNewTab: vi.fn(),
-    toggleForumTabByPeerId: vi.fn()
+    toggleForumTabByPeerId: vi.fn(),
+    // the rows of these tests are standalone elements, so they are in no list and no selection
+    getSelectionForRow: (): undefined => undefined
   },
+  findDialogListElement: (target: HTMLElement) => target
+}));
+
+vi.mock('@components/dialogElement', () => ({
   findDialogListElement: (target: HTMLElement) => target
 }));
 
@@ -41,6 +50,7 @@ vi.mock('@lib/apiManagerProxy', () => ({
   default: {
     getChat: (chatId: ChatId) => mocks.chats.get(+chatId),
     getPeer: (peerId: PeerId) => mocks.peers.get(+peerId),
+    getUser: (userId: UserId) => mocks.peers.get(+userId.toPeerId(false)),
     getCommunityDialog: (): undefined => undefined,
     isForum: () => false,
     isBotforum: () => false
@@ -81,8 +91,25 @@ vi.mock('@components/communities/leaveCommunity', () => ({
   default: vi.fn(),
   canLeaveCommunity: () => true
 }));
+vi.mock('@components/clearHistory', () => ({default: vi.fn()}));
+vi.mock('@components/blockUser', () => ({
+  default: mocks.blockUserWithConfirmation,
+  unblockUser: mocks.unblockUser
+}));
 
 import DialogsContextMenu from '@components/dialogsContextMenu';
+import appDialogsManager from '@lib/appDialogsManager';
+import showChatPreviewPopup from '@components/popups/chatPreview';
+import * as mocked1 from '@lib/appDialogsManager';
+import * as mocked2 from '@lib/appImManager';
+import {registerHotReloadGuard} from '@lib/solidjs/hotReloadGuardProvider';
+
+// the code under test reads the top level from the registry, not from the modules mocked above
+registerHotReloadGuard({
+  appDialogsManager: (mocked1 as any).default,
+  appImManager: (mocked2 as any).default
+});
+
 
 const communityId = 10 as ChatId;
 const communityPeerId = communityId.toPeerId(true);
@@ -90,6 +117,10 @@ const chatId = 20 as ChatId;
 const peerId = chatId.toPeerId(true);
 
 const managers = {
+  appUsersManager: {
+    pushRecentSearch: vi.fn(),
+    removeRecentSearch: vi.fn()
+  },
   appCommunitiesManager: {
     isCommunityMuted: vi.fn(),
     markCommunityRead: vi.fn(),
@@ -101,6 +132,7 @@ const managers = {
     getChat: async(id: ChatId) => mocks.chats.get(+id)
   },
   appMessagesManager: {
+    toggleDialogPin: vi.fn().mockResolvedValue(undefined),
     isDialogUnread: mocks.isDialogUnread
   },
   appNotificationsManager: {
@@ -115,6 +147,9 @@ const managers = {
   },
   filtersStorage: {
     getDialogFilters: mocks.getDialogFilters
+  },
+  appProfileManager: {
+    isUserKnownBlocked: mocks.isUserKnownBlocked
   }
 } as any;
 
@@ -135,8 +170,8 @@ function makeRow(options: {
   return li;
 }
 
-async function openMenu(li: HTMLElement) {
-  const menu = new DialogsContextMenu(managers);
+async function openMenu(li: HTMLElement, options: ConstructorParameters<typeof DialogsContextMenu>[1] = {}) {
+  const menu = new DialogsContextMenu(managers, options);
   menu.attach(document.createElement('ul'));
   await mocks.contextMenuOptions.onOpen(undefined, li);
   const buttons: any[] = [];
@@ -197,8 +232,87 @@ describe('DialogsContextMenu on a Community chat row', () => {
       'MarkAsRead',
       'ChatList.Context.Unmute',
       'Community.RemoveChat',
+      'ClearHistory',
       'Delete'
     ]);
+  });
+
+  it('can remove a recent search peer even when it has no dialog', async() => {
+    mocks.dialogs.clear();
+    const buttons = await openMenu(makeRow({peerId}), {recentSearch: true});
+
+    expect(texts(buttons)).toEqual(['OpenInNewTab', 'DeleteFromRecent']);
+    expect(managers.appUsersManager.pushRecentSearch).not.toHaveBeenCalled();
+    buttons.find((button) => button.text === 'DeleteFromRecent').onClick();
+    expect(managers.appUsersManager.removeRecentSearch).toHaveBeenCalledWith(peerId);
+  });
+
+  it('promotes a recent search peer opened in a new tab', async() => {
+    const row = makeRow({peerId});
+    const buttons = await openMenu(row, {recentSearch: true});
+
+    buttons.find((button) => button.text === 'OpenInNewTab').onClick(new MouseEvent('click'));
+    expect(appDialogsManager.openDialogInNewTab).toHaveBeenCalledWith(row);
+    expect(managers.appUsersManager.pushRecentSearch).toHaveBeenCalledWith(peerId);
+  });
+
+  it('uses the main chat list pin state in recent search while a folder is selected', async() => {
+    appDialogsManager.filterId = 2;
+    try {
+      const buttons = await openMenu(makeRow({peerId}), {recentSearch: true});
+      expect(texts(buttons)).toContain('ChatList.Context.Pin');
+      expect(texts(buttons)).toContain('DeleteFromRecent');
+    } finally {
+      appDialogsManager.filterId = 0;
+    }
+  });
+
+  it('offers dialog actions for top peers independently of the selected folder', async() => {
+    appDialogsManager.filterId = 2;
+    try {
+      const buttons = await openMenu(makeRow({peerId}), {useDialogFolder: true});
+      expect(texts(buttons)).toContain('OpenInNewTab');
+      expect(texts(buttons)).toContain('ChatList.Context.Pin');
+      expect(texts(buttons)).toContain('MarkAsRead');
+      expect(texts(buttons)).not.toContain('DeleteFromRecent');
+    } finally {
+      appDialogsManager.filterId = 0;
+    }
+  });
+
+  it('previews the matching message when opened from a message search result', async() => {
+    const row = makeRow({peerId});
+    row.dataset.mid = '123';
+    const buttons = await openMenu(row, {useDialogFolder: true});
+
+    buttons.find((button) => button.text === 'ChatList.Context.Preview').onClick();
+    expect(showChatPreviewPopup).toHaveBeenCalledWith(expect.objectContaining({
+      peerId,
+      lastMsgId: 123
+    }));
+  });
+
+  it('allows cleanup again after a search menu has closed', async() => {
+    const row = makeRow({peerId});
+    await openMenu(row, {useDialogFolder: true});
+    mocks.contextMenuOptions.onClose();
+
+    expect(row.classList.contains('menu-open')).toBe(false);
+    expect(() => mocks.contextMenuOptions.onClose()).not.toThrow();
+  });
+
+  it('pins archived search results in the archive', async() => {
+    mocks.dialogs.get(+peerId).folder_id = 1;
+    for(const options of [{useDialogFolder: true}, {recentSearch: true}]) {
+      const buttons = await openMenu(makeRow({peerId}), options);
+      buttons.find((button) => button.text === 'ChatList.Context.Pin').onClick();
+
+      expect(managers.appMessagesManager.toggleDialogPin).toHaveBeenLastCalledWith({
+        peerId,
+        filterId: 1,
+        topicOrSavedId: undefined
+      });
+    }
   });
 
   it('drops the chat-list placement actions while the Community is folded', async() => {
@@ -230,6 +344,7 @@ describe('DialogsContextMenu on a Community chat row', () => {
       'ChatList.Context.Unmute',
       'Archive',
       'Community.RemoveChat',
+      'ClearHistory',
       'Delete'
     ]);
   });
@@ -303,5 +418,66 @@ describe('DialogsContextMenu on a Community chat row', () => {
 
     expect(texts(buttons)).toContain('ChatList.Context.Unmute');
     expect(texts(buttons)).not.toContain('ChatList.Context.Mute');
+  });
+});
+
+describe('DialogsContextMenu on a private chat row', () => {
+  const userId = 30 as UserId;
+  const userPeerId = userId.toPeerId(false);
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mocks.contextMenuOptions = undefined;
+    mocks.chats = new Map<number, any>();
+    mocks.peers = new Map<number, any>([
+      [+userPeerId, {_: 'user', id: userId, pFlags: {}}]
+    ]);
+    mocks.dialogs = new Map<number, any>([
+      [+userPeerId, {_: 'dialog', peerId: userPeerId, folder_id: 0, unread_count: 0, pFlags: {}}]
+    ]);
+    mocks.isDialogUnread.mockResolvedValue(false);
+    mocks.isPeerLocalMuted.mockResolvedValue(false);
+    mocks.getDialogFilters.mockResolvedValue([{id: 0}, {id: 1}]);
+    mocks.getDeleteButtonText.mockResolvedValue('DeleteChat');
+    mocks.isUserKnownBlocked.mockResolvedValue(false);
+  });
+
+  it('blocks someone who is not a contact with the confirmation the chat\'s menu shows', async() => {
+    const buttons = await openMenu(makeRow({peerId: userPeerId}));
+    expect(texts(buttons)).toContain('BlockUser');
+    expect(texts(buttons)).not.toContain('Unblock');
+
+    buttons.find((button) => button.text === 'BlockUser').onClick();
+    expect(mocks.blockUserWithConfirmation).toHaveBeenCalledWith({peerId: userPeerId});
+  });
+
+  it('unblocks someone already blocked', async() => {
+    mocks.isUserKnownBlocked.mockResolvedValue(true);
+    const buttons = await openMenu(makeRow({peerId: userPeerId}));
+    expect(texts(buttons)).toContain('Unblock');
+    expect(texts(buttons)).not.toContain('BlockUser');
+
+    buttons.find((button) => button.text === 'Unblock').onClick();
+    expect(mocks.unblockUser).toHaveBeenCalledWith(userPeerId);
+  });
+
+  it('offers neither for a contact, a deleted account or oneself', async() => {
+    for(const pFlags of [{contact: true}, {deleted: true}]) {
+      mocks.peers.set(+userPeerId, {_: 'user', id: userId, pFlags});
+      const buttons = await openMenu(makeRow({peerId: userPeerId}));
+      expect(texts(buttons)).not.toContain('BlockUser');
+      expect(texts(buttons)).not.toContain('Unblock');
+    }
+
+    const myPeerId = (1 as UserId).toPeerId(false);
+    mocks.peers.set(+myPeerId, {_: 'user', id: 1, pFlags: {self: true}});
+    mocks.dialogs.set(+myPeerId, {_: 'dialog', peerId: myPeerId, folder_id: 0, unread_count: 0, pFlags: {}});
+    const buttons = await openMenu(makeRow({peerId: myPeerId}));
+    expect(texts(buttons)).not.toContain('BlockUser');
+  });
+
+  it('keeps Delete last, where the menu renames it', async() => {
+    const buttons = await openMenu(makeRow({peerId: userPeerId}));
+    expect(texts(buttons)[buttons.length - 1]).toBe('Delete');
   });
 });

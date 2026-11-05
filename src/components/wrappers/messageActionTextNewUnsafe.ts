@@ -4,11 +4,15 @@ import htmlToSpan from '@helpers/dom/htmlToSpan';
 import setInnerHTML, {setDirection} from '@helpers/dom/setInnerHTML';
 import {wrapCallDuration} from '@components/wrappers/wrapDuration';
 import paymentsWrapCurrencyAmount from '@helpers/paymentsWrapCurrencyAmount';
+import {absNanos, formatFiat} from '@components/wallet/format';
+import {getWalletFiatRate, loadWalletFiatRate, WalletFiatRate} from '@components/wallet/fiat';
+import {formatTransferGrams, wrapGramTransferCompactText} from '@components/wallet/transferText';
 import {ForumTopic, Message, MessageAction, MessageEntity, MessageMedia, MessageReplyHeader, StarGift, TextWithEntities} from '@layer';
 import getPeerId from '@appManagers/utils/peers/getPeerId';
 import I18n, {FormatterArgument, FormatterArguments, i18n, join, langPack, LangPackKey, _i18n} from '@lib/langPack';
-import {GENERAL_TOPIC_ID} from '@appManagers/constants';
+import {GENERAL_TOPIC_ID, SERVICE_PEER_ID} from '@appManagers/constants';
 import wrapEmojiText from '@lib/richTextProcessor/wrapEmojiText';
+import tsNow from '@helpers/tsNow';
 import wrapPlainText from '@lib/richTextProcessor/wrapPlainText';
 import wrapRichText from '@lib/richTextProcessor/wrapRichText';
 import rootScope from '@lib/rootScope';
@@ -16,21 +20,21 @@ import topicAvatar from '@components/topicAvatar';
 import {wrapCustomEmojiAwaited} from '@components/wrappers/customEmoji';
 import getPeerTitle from '@components/wrappers/getPeerTitle';
 import wrapJoinVoiceChatAnchor from '@components/wrappers/joinVoiceChatAnchor';
+import {getConferenceCallLangKey, getConferenceCallState} from '@lib/calls/helpers/conferenceCallAction';
 import {WrapMessageActionTextOptions} from '@components/wrappers/messageActionTextNew';
 import wrapMessageForReply, {WrapMessageForReplyOptions} from '@components/wrappers/messageForReply';
 import wrapPeerTitle from '@components/wrappers/peerTitle';
 import shouldDisplayGiftCodeAsGift from '@helpers/shouldDisplayGiftCodeAsGift';
 import apiManagerProxy from '@lib/apiManagerProxy';
 import Icon from '@components/icon';
-import formatStarsAmount from '@appManagers/utils/payments/formatStarsAmount';
-import {getPriceChangedActionMessageLangParams} from '@lib/lang';
+import {getPriceChangedActionMessageLangParams, getStarGiftActionLangParams} from '@lib/lang';
 import {numberThousandSplitterForStars} from '@helpers/number/numberThousandSplitter';
 import {getCollectibleName} from '@appManagers/utils/gifts/getCollectibleName';
-import getStarGiftMessageTextDetails from '@appManagers/utils/gifts/getStarGiftMessageTextDetails';
 import {truncateTextWithEntities} from '@lib/richTextProcessor/truncateTextWithEntities';
 import getCommunityServiceMessageKey, {
   getCommunityServiceTitle
 } from '@components/wrappers/getCommunityServiceMessageKey';
+import {bindManagersToSession} from '@lib/accounts/bindManagersToAccount';
 
 async function wrapLinkToMessage(options: WrapMessageForReplyOptions) {
   const wrapped = await wrapMessageForReply(options);
@@ -208,10 +212,11 @@ export default async function wrapMessageActionTextNewUnsafe(options: WrapMessag
     let icon: HTMLElement | undefined;
     let args: Array<FormatterArgument | Promise<FormatterArgument>>;
 
-    const managers = rootScope.managers;
+    const managers = bindManagersToSession(rootScope.managers);
 
-    const getNameDivHTML = (peerId: PeerId, plain: boolean) => {
-      return plain ? getPeerTitle({peerId, plainText: plain}) : wrapPeerTitle({peerId});
+    const getNameDivHTML = (peerId: PeerId, plain: boolean, onlyFirstName?: boolean) => {
+      // a name in a service message opens its peer on click (onBubblesClick): a link to it
+      return plain ? getPeerTitle({peerId, plainText: plain, onlyFirstName}) : wrapPeerTitle({peerId, link: !noLinks, onlyFirstName});
     };
 
     const wrapTruncatedText = (text: string, entities: MessageEntity[] | undefined, maxLength: number) => {
@@ -287,27 +292,16 @@ export default async function wrapMessageActionTextNewUnsafe(options: WrapMessag
       }
 
       case 'messageActionConferenceCall': {
-        // tdesktop renders this as a media bubble (MediaCall) with state
-        // Invitation / Active / Missed / Hangup. We render service text +
-        // a Join anchor while the call is still joinable. The Join anchor
-        // resolves the conference via inputGroupCallInviteMessage(msg_id).
-        const isMissed = !!action.pFlags.missed;
-        const hasDuration = action.duration !== undefined;
-        const isJoinable = !isMissed && !hasDuration;
-        const isOut = !!message.pFlags.out;
-
-        if(isMissed) {
-          langPackKey = 'Chat.Service.ConferenceCall.Missed';
-          args = [];
-        } else if(hasDuration) {
-          langPackKey = 'Chat.Service.ConferenceCall.Ended';
-          args = [wrapCallDuration(action.duration, plain)];
-        } else {
-          langPackKey = isOut ?
-            'Chat.Service.ConferenceCall.Outgoing' :
-            'Chat.Service.ConferenceCall.Incoming';
-          args = [noLinks || !isJoinable ? '' : wrapJoinVoiceChatAnchor(message as any)];
-        }
+        // Same title tdesktop's `MediaCall::Text` produces for the call bubble
+        // (rendered by `wrapCallBubble`) — here it serves the plain-text uses:
+        // chat list previews, replies, notifications, and the fallback for
+        // browsers that render the action as a service message because they
+        // cannot join a group call at all.
+        langPackKey = getConferenceCallLangKey(
+          getConferenceCallState(action),
+          !!message.pFlags.out
+        );
+        args = [];
         break;
       }
 
@@ -719,6 +713,64 @@ export default async function wrapMessageActionTextNewUnsafe(options: WrapMessag
         break;
       }
 
+      case 'messageActionWalletTonConnectRequest': {
+        // * a connected app's request (TON Connect): pending until the server marks it answered or it expires
+        const name = action.dapp_name?.replace(/[\u0000-\u001f\u007f\u200e\u200f\u202a-\u202e\u2066-\u2069]/g, '').trim();
+        const state = action.pFlags.accepted ? 'Processed' : action.pFlags.declined ? 'Declined' : action.expires <= tsNow(true) ? 'Expired' : 'Pending';
+        // * what a pending request asks for, by its method (tdesktop): a transfer unless named otherwise
+        const asks = state === 'Pending' && name && (action.topic === 'signData' || action.topic === 'disconnect') ? action.topic : '';
+        langPackKey = (asks ?
+          (asks === 'signData' ? 'Wallet.Action.TonConnectAppSignData' : 'Wallet.Action.TonConnectAppDisconnect') :
+          name ? 'WalletTonConnectRequestApp' + state : 'WalletTonConnectRequest' + state) as LangPackKey;
+        args = name ? [wrapSomeText(name, plain, [{_: 'messageEntityBold', offset: 0, length: name.length}])] : [];
+        break;
+      }
+
+      case 'messageActionGramTransfer': {
+        const out = !!message.pFlags.out;
+        // * the service account's transfers name nobody, as in the desktop client: "You received 1.5 Grams"
+        const anonymous = message.peerId === SERVICE_PEER_ID;
+        // * under the sender's name (a chat list row, a notification): "sent you 1.5 Grams", no name, no fiat
+        if(options.compact) {
+          const text = wrapGramTransferCompactText({transfer: action, out, anonymous, notification: options.compact === 'notification'});
+          if(plain) return text;
+          element.append(wrapSomeText(text, plain));
+          return element;
+        }
+
+        // * "You sent 1.5 Grams ($4.20) to Alice" / "Alice sent you 1.5 Grams ($4.20)": at most three decimals, the
+        // * value in the wallet's currency, the first name (iOS walletTransferServiceMessageString, tdesktop shortName)
+        const nanos = absNanos(action.amount);
+        const grams = formatTransferGrams(nanos);
+        const withFiat = (rate: WalletFiatRate) => {
+          // * "(2 308,64 €)" stays on one line
+          const fiat = rate && formatFiat(nanos, rate.perGram, rate.currency).replace(/ /g, '\u00a0');
+          return fiat ? I18n.format('WalletTransferWorth', true, [grams, fiat]) : grams;
+        };
+        const rate = getWalletFiatRate();
+        let amount: FormatterArgument = withFiat(rate);
+        if(!plain) {
+          const span = document.createElement('span');
+          span.textContent = amount;
+          // * a currency other than the dollar has its rate a moment later the first time: the value follows then
+          if(!rate) loadWalletFiatRate().then((rate) => rate && (span.textContent = withFiat(rate)));
+          amount = span;
+        }
+
+        if(anonymous) {
+          langPackKey = out ? 'Wallet.Action.SentUnknown' : 'Wallet.Action.ReceivedUnknown';
+          args = [amount];
+        } else if(out) {
+          langPackKey = 'Wallet.Action.Sent';
+          args = [amount, getNameDivHTML(message.peerId, plain, true)];
+        } else {
+          langPackKey = 'Wallet.Action.Received';
+          args = [getNameDivHTML(message.fromId, plain, true), amount];
+        }
+
+        break;
+      }
+
       case 'messageActionWebViewDataSent': {
         langPackKey = 'ActionBotWebViewData';
         args = [wrapSomeText(action.text, plain)];
@@ -793,37 +845,19 @@ export default async function wrapMessageActionTextNewUnsafe(options: WrapMessag
         args = [+action.stars];
         break;
       }
-      case 'messageActionStarGift': {
-        const {direction, fromId} = getStarGiftMessageTextDetails(message, action, rootScope.myId);
-        if(direction === 'self') {
-          langPackKey = 'StarGiftSentMessageSelf';
-          args = [(action.gift as StarGift.starGift).stars];
-        } else if(direction === 'outgoing') {
-          langPackKey = action.pFlags.upgrade_separate ? 'StarGiftSentMessagePrepaidOutgoing' : 'StarGiftSentMessageOutgoing';
-          args = [(action.gift as StarGift.starGift).stars];
-        } else {
-          langPackKey = action.pFlags.upgrade_separate ? 'StarGiftSentMessagePrepaidIncoming' : 'StarGiftSentMessageIncoming';
-          args = [getNameDivHTML(fromId, plain), (action.gift as StarGift.starGift).stars];
-        }
+      case 'messageActionStarGift':
+      case 'messageActionStarGiftUnique': {
+        const params = getStarGiftActionLangParams({
+          message,
+          action,
+          myId: rootScope.myId,
+          peerTitle: (peerId) => getNameDivHTML(peerId, plain)
+        });
+
+        langPackKey = params.langPackKey;
+        args = params.args;
         break;
       }
-      case 'messageActionStarGiftUnique':
-        if(!message.pFlags.out && action.resale_amount) {
-          langPackKey = action.resale_amount._ === 'starsTonAmount' ? 'StarGiftSentMessageSelfTon' : 'StarGiftSentMessageSelf';
-          args = [formatStarsAmount(action.resale_amount)];
-        } else if(message.peerId === rootScope.myId) {
-          langPackKey = action.pFlags.upgrade ? 'ActionGiftUpgradedSelf' : 'ActionGiftTransferredSelf';
-        } else {
-          if(action.pFlags.upgrade) {
-            langPackKey = message.pFlags.out ? 'ActionGiftUpgradedOutbound' : 'ActionGiftUpgradedInbound';
-          } else if(message.pFlags.out && action.pFlags.from_offer) {
-            langPackKey = 'ActionGiftSold';
-          } else {
-            langPackKey = message.pFlags.out ? 'ActionGiftTransferredOutbound' : 'ActionGiftTransferredInbound';
-          }
-          args = [getNameDivHTML(message.peerId, plain)];
-        }
-        break;
 
       case 'messageActionTodoAppendTasks': {
         let listMsg = await managers.appMessagesManager.getMessageByPeer(message.peerId, message.reply_to_mid);
@@ -1023,6 +1057,40 @@ export default async function wrapMessageActionTextNewUnsafe(options: WrapMessag
       case 'messageActionManagedBotCreated': {
         langPackKey = 'CreateBot.BotWasCreated';
         args = [getNameDivHTML(action.bot_id.toPeerId(), plain)];
+        break;
+      }
+      // layer 229: someone joined this group through a community it belongs to. Rendered like
+      // tdesktop's `lng_action_user_joined_via_community` — the joiner plus a link to the
+      // community, falling back to the community-less wording when the chat is not known yet.
+      case 'messageActionChatJoinedViaCommunity': {
+        const communityId = action.community_id &&
+          action.community_id !== '0' &&
+          action.community_id !== 0 ?
+          action.community_id.toChatId() :
+          undefined;
+        const community = communityId ?
+          apiManagerProxy.getChat(communityId) :
+          undefined;
+        const communityTitle = getCommunityServiceTitle(community);
+
+        args = [getNameDivHTML(message.fromId, plain)];
+
+        if(communityTitle) {
+          langPackKey = 'Chat.Service.JoinedViaCommunity';
+
+          if(plain) {
+            args.push(communityTitle);
+          } else if(noLinks) {
+            const bold = document.createElement('b');
+            bold.textContent = communityTitle;
+            args.push(bold);
+          } else {
+            args.push(getNameDivHTML(communityId.toPeerId(true), plain));
+          }
+        } else {
+          langPackKey = 'Chat.Service.JoinedViaCommunity.Unknown';
+        }
+
         break;
       }
       case 'messageActionChangeCommunity': {

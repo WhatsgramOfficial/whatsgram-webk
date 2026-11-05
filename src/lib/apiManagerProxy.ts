@@ -1,6 +1,6 @@
 import type {ModifyFunctionsToAsync} from '@types';
 import {type State} from '@config/state';
-import type {Chat, ChatFull, ChatPhoto, Message, MessagePeerReaction, PeerNotifySettings, User, UserProfilePhoto} from '@layer';
+import type {Chat, ChatFull, ChatPhoto, Message, MessagePeerReaction, PeerNotifySettings, Reaction, User, UserProfilePhoto} from '@layer';
 import type {CryptoMethods} from '@lib/crypto/crypto_methods';
 import type ThumbsStorage from '@lib/storages/thumbs';
 import type {ThumbStorageMedia} from '@lib/storages/thumbs';
@@ -10,6 +10,7 @@ import type {AppAvatarsManager, PeerPhotoSize} from '@appManagers/appAvatarsMana
 import rootScope, {BroadcastEvents} from '@lib/rootScope';
 import webpWorkerController from '@lib/webp/webpWorkerController';
 import DEBUG, {MOUNT_CLASS_TO} from '@config/debug';
+import {isLogBufferEnabled} from '@lib/debug/logsBuffer';
 import sessionStorage from '@lib/sessionStorage';
 import {writeEncryptionKeyHandoff} from '@lib/passcode/keyHandoff';
 import webPushApiManager from '@lib/webPushApiManager';
@@ -28,6 +29,7 @@ import idleController from '@helpers/idleController';
 import ServiceMessagePort from '@lib/serviceWorker/serviceMessagePort';
 import deferredPromise, {CancellablePromise} from '@helpers/cancellablePromise';
 import {makeWorkerURL} from '@helpers/setWorkerProxy';
+import usableWorkerURL from '@helpers/usableWorkerURL';
 import ServiceWorkerURL from '../../sw?worker&url';
 import MainWorkerURL from './mainWorker/index.worker.ts?worker&url';
 import setDeepProperty, {joinDeepPath, splitDeepPath} from '@helpers/object/setDeepProperty';
@@ -36,30 +38,33 @@ import {NULL_PEER_ID, TEST_NO_STREAMING, THUMB_TYPE_FULL} from '@appManagers/con
 import generateEmptyThumb from '@lib/storages/utils/thumbs/generateEmptyThumb';
 import getStickerThumbKey from '@lib/storages/utils/thumbs/getStickerThumbKey';
 import callbackify from '@helpers/callbackify';
-import isLegacyMessageId from '@appManagers/utils/messageId/isLegacyMessageId';
+import isGlobalHistoryMessageId from '@appManagers/utils/messageId/isGlobalHistoryMessageId';
 import {forgetLoadedURL} from '@helpers/dom/loadedUrlCache';
 import type {SharedObjectURLUpdate} from '@helpers/objectUrlUtils';
-import {setAppStateSilent} from '@stores/appState';
+import {replaceAppStateSilent, setAppStateSilent} from '@stores/appState';
+// * keeps the page's ignored restriction reasons in step with the mirrored state from the start
+import '@stores/contentSettings';
 import getObjectKeysAndSort from '@helpers/object/getObjectKeysAndSort';
-import {reconcilePeer, reconcilePeers} from '@stores/peers';
-import {getCurrentAccount} from '@lib/accounts/getCurrentAccount';
+import {reconcilePeer, reconcilePeers, resetPeers} from '@stores/peers';
+import {getCurrentAccount, setCurrentAccount} from '@lib/accounts/getCurrentAccount';
 import {ActiveAccountNumber} from '@lib/accounts/types';
-import {createProxiedManagersForAccount} from '@lib/getProxiedManagers';
+import {createProxiedManagersForAccount, getAccountManagers, getOtherAccountManagers} from '@lib/getProxiedManagers';
+import {takesCallEvent} from '@lib/calls/callAccount';
 import noop from '@helpers/noop';
 import AccountController from '@lib/accounts/accountController';
-import getPeerTitle from '@components/wrappers/getPeerTitle';
+import getPeerTitleText from '@components/wrappers/getPeerTitleText';
 import I18n from '@lib/langPack';
 import {NOTIFICATION_BADGE_PATH} from '@config/notifications';
 import {createAppURLForAccount} from '@lib/accounts/createAppURLForAccount';
 import {setAppSettingsSilent} from '@stores/appSettings';
 import {batch} from 'solid-js';
 import createNotificationImage from '@helpers/createNotificationImage';
-import PasscodeLockScreenController from '@components/passcodeLock/passcodeLockScreenController';
-import EncryptionKeyStore from '@lib/passcode/keyStore';
+import EncryptionKeyStore, {importEncryptionKey} from '@lib/passcode/keyStore';
 import DeferredIsUsingPasscode from '@lib/passcode/deferredIsUsingPasscode';
 import CacheStorageController, {CacheStorageDbName} from '@lib/files/cacheStorage';
 import type {PushSingleManager} from '@appManagers/pushSingleManager';
 import getDeepProperty from '@helpers/object/getDeepProperty';
+import isObject from '@helpers/object/isObject';
 import {_changeHistoryStorageKey, _deleteHistoryStorage, _iterateHistoryStorages, _useHistoryStorage} from '@stores/historyStorages';
 import {
   reconcileCommunityDialog,
@@ -72,7 +77,7 @@ import {
 import SlicedArray, {SliceEnd} from '@helpers/slicedArray';
 import {createHistoryStorageSearchSlicedArray} from '@appManagers/utils/messages/createHistoryStorage';
 import tabId from '@config/tabId';
-import Modes from '@config/modes';
+import Modes, {getURLWithoutFlags} from '@config/modes';
 import appNavigationController from '@components/appNavigationController';
 import {BroadcastChannelWrapper, createBroadcastChannelWrapper} from './broadcastChannelWrapper';
 import {MainBroadcastChannelEvents, unversionedMainBroadcastChannelName} from '@config/broadcastChannel';
@@ -92,6 +97,7 @@ import type {
   CommunityDialog,
   CommunityPeerLinkRequestsState
 } from '@appManagers/appCommunitiesManager';
+import {bindManagersToSession} from '@lib/accounts/bindManagersToAccount';
 
 
 export type Mirrors = {
@@ -142,6 +148,8 @@ export type NotificationBuildMessageTaskPayload = {
   fwdCount?: number,
   peerReaction?: MessagePeerReaction,
   peerTypeNotifySettings?: PeerNotifySettings,
+  /** the chat's sound is off: shown without one */
+  noSound?: boolean,
   accountNumber: ActiveAccountNumber,
   isOtherTabActive?: boolean
 };
@@ -152,8 +160,18 @@ export type NotificationBuildStoryTaskPayload = {
   isOtherTabActive?: boolean
 };
 
-// * discriminated union: `'story' in payload` narrows to the story variant
-export type NotificationBuildTaskPayload = NotificationBuildMessageTaskPayload | NotificationBuildStoryTaskPayload;
+export type NotificationBuildStoryReactionTaskPayload = {
+  // * peerId is the one who reacted, storyId is our own story they reacted to
+  storyReaction: {peerId: PeerId, storyId: number, reaction: Reaction, showPreview: boolean},
+  accountNumber: ActiveAccountNumber,
+  isOtherTabActive?: boolean
+};
+
+// * discriminated union: `'story' in payload` / `'storyReaction' in payload` narrow to their variant
+export type NotificationBuildTaskPayload =
+  NotificationBuildMessageTaskPayload |
+  NotificationBuildStoryTaskPayload |
+  NotificationBuildStoryReactionTaskPayload;
 
 export type TabState = {
   chatPeerIds: PeerId[],
@@ -174,6 +192,8 @@ class ApiManagerProxy extends MTProtoMessagePort {
   private allTabStates: TabState[];
 
   public share: ShareData;
+  /** what the worker's lock toggles: the lock screen's controller sets it, so that this module does not import UI */
+  public onToggleLock: (isLocked: boolean) => void;
 
   public serviceMessagePort: ServiceMessagePort<true>;
   private lastServiceWorker: ServiceWorker;
@@ -384,7 +404,15 @@ class ApiManagerProxy extends MTProtoMessagePort {
           // @ts-ignore
           slicedArray[smth1](...payload.value);
         } else {
-          setHistoryStorage(property as any, payload.value);
+          // * what the worker put there takes the place of what was: a store merges an object into the one before
+          // * it, which would keep what the old had and the new lacks (a keyboard's rows under the force reply after it)
+          batch(() => {
+            if(isObject(historyStorage[property as keyof typeof historyStorage])) {
+              setHistoryStorage(property as any, undefined);
+            }
+
+            setHistoryStorage(property as any, payload.value);
+          });
         }
 
         return false;
@@ -419,6 +447,7 @@ class ApiManagerProxy extends MTProtoMessagePort {
       'notification_count_update',
       'account_logged_in',
       'notification_cancel',
+      'notification_cancel_up_to',
       'toggle_using_passcode'
     ]);
 
@@ -434,7 +463,11 @@ class ApiManagerProxy extends MTProtoMessagePort {
 
       event: ({name, args, accountNumber}) => {
         const isDifferentAccount = accountNumber && accountNumber !== getCurrentAccount();
-        if(!commonEventNames.has(name as keyof BroadcastEvents) && isDifferentAccount) return;
+        // * a call goes on after the tab has switched to another account: what is said about it comes
+        // * from its own account, whichever the tab shows
+        const isTakenAsCallEvent = takesCallEvent(name, args, accountNumber || getCurrentAccount());
+        if(isTakenAsCallEvent === false) return;
+        if(isTakenAsCallEvent === undefined && isDifferentAccount && !commonEventNames.has(name as keyof BroadcastEvents)) return;
         // @ts-ignore
         rootScope.dispatchEventSingle(name, ...args);
       },
@@ -470,7 +503,7 @@ class ApiManagerProxy extends MTProtoMessagePort {
         const managers = createProxiedManagersForAccount(accountNumber);
         const peerId = payload.callerId.toPeerId();
         const peer = await managers.appPeersManager.getPeer(peerId);
-        const title = await getPeerTitle({peerId: peerId, managers, plainText: true, limitSymbols: 20, useManagers: true});
+        const title = await getPeerTitleText({peerId: peerId, managers, plainText: true, limitSymbols: 20, useManagers: true});
 
         const notification = new Notification(title, {
           body: I18n.format('Call.StatusCalling', true),
@@ -502,25 +535,22 @@ class ApiManagerProxy extends MTProtoMessagePort {
         }
       },
 
-      saveEncryptionKey: (payload) => {
-        EncryptionKeyStore.save(payload);
+      saveEncryptionKey: async(payload) => {
+        EncryptionKeyStore.save(await importEncryptionKey(payload));
       },
 
       toggleLock: (isLocked) => {
-        if(isLocked) {
-          PasscodeLockScreenController.lock();
-        } else {
-          PasscodeLockScreenController.unlock();
-        }
+        this.onToggleLock?.(isLocked);
       },
 
       toggleCacheStorage: (enabled) => {
         CacheStorageController.temporarilyToggle(enabled);
       },
 
-      toggleUsingPasscode: (payload) => {
+      toggleUsingPasscode: async(payload) => {
+        const encryptionKey = await importEncryptionKey(payload.encryptionKey);
         DeferredIsUsingPasscode.resolveDeferred(payload.isUsingPasscode);
-        EncryptionKeyStore.save(payload.encryptionKey);
+        EncryptionKeyStore.save(encryptionKey);
       }
 
       // hello: () => {
@@ -530,8 +560,8 @@ class ApiManagerProxy extends MTProtoMessagePort {
 
     this.mainBroadcastChannel = createBroadcastChannelWrapper<MainBroadcastChannelEvents>(unversionedMainBroadcastChannelName);
 
-    this.mainBroadcastChannel.on('reload', () => {
-      appNavigationController.reload();
+    this.mainBroadcastChannel.on('reload', (payload) => {
+      appNavigationController.reload(payload ? getURLWithoutFlags(payload.dropFlags) : undefined);
     });
 
     this.cacheStorageThreadedControls = createCacheStorageThreadedControls({apiManagerProxy: this});
@@ -701,9 +731,10 @@ class ApiManagerProxy extends MTProtoMessagePort {
     this.log('Passing environment:', ENVIRONMENT);
     this.invoke('environment', ENVIRONMENT);
     // The worker's own location.search has no ?debug=1, so DEBUG is false there
-    // in production. Mirror the page's debug state so the worker records logs
-    // too. Fire-and-forget; re-applied on every (re)connect.
-    this.invokeVoid('setLogBufferEnabled', DEBUG);
+    // in production. Mirror the page's state - debug, or logs collected from
+    // Settings → Experimental - so the worker records logs too. Fire-and-forget;
+    // re-applied on every (re)connect.
+    this.invokeVoid('setLogBufferEnabled', isLogBufferEnabled());
   }
 
   public pingServiceWorkerWithIframe() {
@@ -751,10 +782,21 @@ class ApiManagerProxy extends MTProtoMessagePort {
     this.serviceMessagePort.attachSendPort(this.lastServiceWorker = serviceWorker);
     this.serviceMessagePort.invokeVoid('hello', undefined);
     this.serviceMessagePort.invokeVoid('environment', ENVIRONMENT);
-    this.serviceMessagePort.invokeVoid('setLogBufferEnabled', DEBUG);
+    this.serviceMessagePort.invokeVoid('setLogBufferEnabled', isLogBufferEnabled());
+    this.sendPasscodeStateToServiceWorker();
+  }
 
-    DeferredIsUsingPasscode.isUsingPasscode().then((value) => {
-      this.serviceMessagePort.invokeVoid('toggleUsingPasscode', {type: 'init', isUsingPasscode: value});
+  /**
+   * The service worker keeps the passcode state only in memory, and the browser restarts it at will -
+   * so it is told again on every `hello`, with the key when this tab is unlocked
+   */
+  private sendPasscodeStateToServiceWorker() {
+    DeferredIsUsingPasscode.isUsingPasscode().then((isUsingPasscode) => {
+      const encryptionKey = isUsingPasscode ? EncryptionKeyStore.getUndeferred() : undefined;
+      this.serviceMessagePort.invokeVoid('toggleUsingPasscode', encryptionKey ?
+        {type: 'full', isUsingPasscode, encryptionKey} :
+        {type: 'init', isUsingPasscode}
+      );
     });
   }
 
@@ -820,7 +862,10 @@ class ApiManagerProxy extends MTProtoMessagePort {
   }
 
   private registerServiceWorker() {
-    if(!('serviceWorker' in navigator)) return;
+    if(!('serviceWorker' in navigator)) { // * none in this browser: the worker takes one for online until told otherwise
+      this.invokeVoid('serviceWorkerOnline', false);
+      return;
+    }
 
     if(Modes.noServiceWorker) {
       navigator.serviceWorker.getRegistrations().then(regs => {
@@ -878,6 +923,8 @@ class ApiManagerProxy extends MTProtoMessagePort {
           this.log('got hello from service worker');
           this.serviceMessagePort.resendLockTask(source);
           this.serviceMessagePort.invokeVoid('environment', ENVIRONMENT);
+          this.serviceMessagePort.invokeVoid('tabAccount', getCurrentAccount());
+          this.sendPasscodeStateToServiceWorker();
         },
 
         share: (payload) => {
@@ -948,8 +995,21 @@ class ApiManagerProxy extends MTProtoMessagePort {
     // Keep MTProto/crypto on the shared worker, but hand the lottie pool per-tab dedicated Workers.
     const constructor = IS_SHARED_WORKER_SUPPORTED && !(IS_SAFARI && type === 'lottie') ? SharedWorker : Worker;
 
+    // Ports of workers this tab had to build for itself (see usableWorkerURL) - they must not travel
+    // to the main worker: a tab-local worker dies with its tab, while the main worker counts threaded
+    // ports up to a cap and never counts them back down, so one closed tab would starve the pool for
+    // every other one. The tab drives its own fallback worker directly; the main worker keeps the
+    // shared members it already has.
+    const tabLocalPorts = new Set<MessageEventSource>();
+
     superMessagePort.addEventListener('port', (payload, source, event) => {
-      this.invokeVoid('threadedPort', type, undefined, [event.ports[0]]);
+      const port = event.ports[0];
+      if(tabLocalPorts.has(source)) {
+        port.close();
+        return;
+      }
+
+      this.invokeVoid('threadedPort', type, undefined, [port]);
     });
 
     const firstWorker = createWorker(originalUrl);
@@ -957,11 +1017,22 @@ class ApiManagerProxy extends MTProtoMessagePort {
 
     const blob = await get(originalUrl);
     const urlsPromise = await this.invoke('createProxyWorkerURLs', {originalUrl, blob, type});
-    const workers = urlsPromise.slice(1).map(createWorker);
-    workers.forEach(attachWorkerToPort);
+    const usableUrls = await Promise.all(
+      urlsPromise.slice(1).map((url) => usableWorkerURL(
+        url,
+        blob,
+        () => this.log.warn(type, 'threaded worker URL is not loadable in this tab, using a local one')
+      ))
+    );
+    usableUrls.forEach((url, index) => {
+      const port = attachWorkerToPort(createWorker(url));
+      if(url !== urlsPromise[index + 1]) {
+        tabLocalPorts.add(port);
+      }
+    });
 
     if(DEBUG) {
-      console.log('Workers URLs', type, urlsPromise);
+      console.log('Workers URLs', type, [originalUrl, ...usableUrls]);
     }
   }
 
@@ -1038,6 +1109,8 @@ class ApiManagerProxy extends MTProtoMessagePort {
     worker.addEventListener('error', (err) => {
       this.log.error(type, 'worker error', err);
     });
+
+    return port;
   }
 
   private onWorkerFirstMessage(worker: any) {
@@ -1066,15 +1139,73 @@ class ApiManagerProxy extends MTProtoMessagePort {
     return loadedStates;
   }
 
-  private async dispatchUserAuth() {
-    const accountData = await AccountController.get(getCurrentAccount());
+  private async dispatchUserAuth(single?: boolean, accountData?: Awaited<ReturnType<typeof AccountController.get>>) {
+    accountData ??= await AccountController.get(getCurrentAccount());
     if(accountData.userId) {
-      rootScope.dispatchEvent('user_auth', {
+      rootScope[single ? 'dispatchEventSingle' : 'dispatchEvent']('user_auth', {
         dcID: accountData.dcId || 0,
         date: accountData.date || (Date.now() / 1000 | 0),
         id: accountData.userId.toPeerId(false)
       });
     }
+  }
+
+  /**
+   * Moves this tab's mirrors to another signed-in account: whatever the previous one left is dropped,
+   * the worker sends the new one's snapshots, and its state replaces the old one's.
+   * The UI of the previous account must be gone by now.
+   */
+  public async switchAccount(accountNumber: ActiveAccountNumber) {
+    // * who the account is goes in with it: its events are let in from here on, and what they bring is checked
+    // * against it (an incoming call is the account's only when it is addressed to it)
+    const accountData = await AccountController.get(accountNumber);
+    setCurrentAccount(accountNumber);
+    void this.dispatchUserAuth(true, accountData);
+    // * the session of the account switched to, which begins here
+    // oxlint-disable-next-line tweb/managers-before-await -- the new account's session, begun just above
+    const managers = bindManagersToSession(rootScope.managers);
+    this.updateTabState('accountNumber', accountNumber);
+    // * the service worker streams media for the account of the tab, and the tab's url would not tell it
+    this.serviceMessagePort?.invokeVoid('tabAccount', accountNumber);
+    this.resetAccountMirrors();
+
+    const [state] = await Promise.all([
+      managers.appStateManager.getState(),
+      this.invoke('mirrorAll', {accountNumber})
+    ]);
+
+    this.mirrors.state = state;
+    replaceAppStateSilent(state);
+
+    // * an account this tab has not shown yet can lack even itself, and the screens read it at once
+    if(!this.mirrors.peers[rootScope.myId]) {
+      await managers.appUsersManager.getApiUsers([{_: 'inputUserSelf'}]).catch(noop);
+    }
+
+    rootScope.premium = await managers.rootScope.getPremium();
+  }
+
+  private resetAccountMirrors() {
+    const {avatars} = this.mirrors;
+    for(const peerId in avatars) {
+      const sizes = avatars[peerId];
+      for(const size in sizes) {
+        const url = sizes[size as keyof typeof sizes];
+        typeof(url) === 'string' && forgetLoadedURL(url);
+      }
+    }
+
+    // * thumbs and stickerThumbs are left to the snapshot: it reconciles them in full
+    this.mirrors.avatars = {};
+    this.mirrors.messages = {};
+    this.mirrors.groupedMessages = {};
+    this.mirrors.peers = {};
+    this.mirrors.availableReactions = undefined;
+    this.appConfig = undefined;
+    resetPeers();
+    _iterateHistoryStorages((key, value) => {
+      this.clearHistoryStorage(key, value, true);
+    });
   }
 
   public hasTabOpenFor(accountNumber: ActiveAccountNumber) {
@@ -1157,7 +1288,7 @@ class ApiManagerProxy extends MTProtoMessagePort {
 
   public getMessageFromStorage(key: MessagesStorageKey, mid: number) {
     // * use global storage instead
-    if(key.endsWith('history') && isLegacyMessageId(mid)) {
+    if(key.endsWith('history') && isGlobalHistoryMessageId(mid)) {
       key = this.getGlobalHistoryMessagesStorage();
     }
 
@@ -1203,7 +1334,7 @@ class ApiManagerProxy extends MTProtoMessagePort {
   }
 
   public getMessageById(messageId: number) {
-    if(isLegacyMessageId(messageId)) {
+    if(isGlobalHistoryMessageId(messageId)) {
       return this.getMessageFromStorage(this.getGlobalHistoryMessagesStorage(), messageId);
     }
   }
@@ -1278,9 +1409,9 @@ class ApiManagerProxy extends MTProtoMessagePort {
   }
 
   public loadAvatar(peerId: PeerId, photo: UserProfilePhoto.userProfilePhoto | ChatPhoto.chatPhoto, size: PeerPhotoSize, accountNumber?: ActiveAccountNumber) {
-    if(accountNumber && accountNumber !== getCurrentAccount()) {
-      const managers = createProxiedManagersForAccount(accountNumber);
-      return managers.appAvatarsManager.loadAvatar(peerId, photo, size);
+    const otherAccountManagers = getOtherAccountManagers(accountNumber);
+    if(otherAccountManagers) {
+      return otherAccountManagers.appAvatarsManager.loadAvatar(peerId, photo, size);
     }
 
     const saved = this.mirrors.avatars[peerId] ??= {};
@@ -1288,7 +1419,10 @@ class ApiManagerProxy extends MTProtoMessagePort {
       return saved[size];
     }
 
-    const promise = saved[size] = rootScope.managers.appAvatarsManager.loadAvatar(peerId, photo, size);
+    // * one asked for an account by name - a call's, which outlives a switch - goes through that account's own
+    // * managers: what comes back once the tab is on another account still reaches whoever asked
+    const managers = accountNumber ? getAccountManagers(accountNumber) : bindManagersToSession(rootScope.managers);
+    const promise = saved[size] = managers.appAvatarsManager.loadAvatar(peerId, photo, size);
     // Don't permanently cache a failed load — allow a retry: any rejection
     // (e.g. FILE_ID_INVALID for a stale photo_id), or a video load that
     // resolved to nothing.
@@ -1334,11 +1468,8 @@ class ApiManagerProxy extends MTProtoMessagePort {
   }
 
   public async hasSomeonePremium() {
-    const totalAccounts = await AccountController.getTotalAccounts();
-
     let hasSomeonePremium = false;
-    for(let i = 1; i <= totalAccounts; i++) {
-      const accountNumber = i as ActiveAccountNumber;
+    for(const accountNumber of await AccountController.getAccountNumbers()) {
       const managers = createProxiedManagersForAccount(accountNumber);
       hasSomeonePremium ||= await managers.rootScope.getPremium();
       if(hasSomeonePremium) break;
@@ -1414,9 +1545,18 @@ class ApiManagerProxy extends MTProtoMessagePort {
   }
 
   public lock() {
+    this.reloadEveryTab();
+  }
+
+  /**
+   * Every tab of the site starts again. The worker they share goes first, so none of them comes back to it: the
+   * next one starts with what has changed. `dropFlags` leave every tab's URL; `url` is where this tab goes, when its
+   * own query string changes more than that
+   */
+  public reloadEveryTab(dropFlags: string[] = [], url?: URL) {
     this.invokeVoid('terminate', undefined);
-    this.mainBroadcastChannel.emitVoid('reload');
-    appNavigationController.reload();
+    this.mainBroadcastChannel.emit('reload', dropFlags.length ? {dropFlags} : undefined);
+    appNavigationController.reload(url ?? getURLWithoutFlags(dropFlags));
   }
 
   public async clearCacheStoragesByNames(names: CacheStorageDbName[]) {
